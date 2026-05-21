@@ -1,45 +1,58 @@
 #!/usr/bin/env bash
-# SFT seed: distill teacher CoTs into Qwen2.5-Omni-3B (student) before GRPO.
-# 2x 96GB GPUs, LoRA, gradient checkpointing, zero3, capped video pixels to
-# avoid OOM on long ads. Save every 25 steps so RL can resume after partial.
+# SFT seed: train Qwen2.5-Omni-3B on the CoT-distilled TTCC dataset.
+#
+# Defaults: 1 epoch, FPS_MAX_FRAMES=32 (slightly more frames than infer/GRPO
+# to maximize visual context during gradient steps), cosine LR.
+#
+# Overridable env vars (see _common.sh for the full set):
+#   DATASET     path to ms-swift JSONL
+#   OUT         output directory for checkpoints + log
+#   EPOCHS      number of training epochs
+#   LR          peak learning rate (cosine to 0 by end of training)
+#   SAVE_STEPS  save every N steps; controls --save_steps and --eval_steps
+#   SAVE_LIMIT  --save_total_limit
+#   FPS_MAX_FRAMES (default 32; lower it for FPS-limited variants)
 set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${HERE}/_common.sh"
 
-WORK="${WORK:-/home/ssm-user/work}"
-VENV="${VENV:-/opt/dlami/nvme/work/swift_venv}"
-SFT_DATA="${WORK}/data/ttcc_swift/ttcc_train_sft.jsonl"
-OUT="${WORK}/work-out/ttcc_sft"
+# Per-experiment knobs (env-overridable).
+: "${DATASET:=${WORK}/data/ttcc_swift/ttcc_train_sft.jsonl}"
+: "${OUT:=${WORK}/work-out/ttcc_sft}"
+: "${EPOCHS:=1}"
+: "${LR:=1e-4}"
+: "${SAVE_STEPS:=50}"
+: "${SAVE_LIMIT:=3}"
+: "${LOGGING_STEPS:=5}"
+# Default to a slightly more generous frame budget for SFT.
+: "${SFT_FPS_MAX_FRAMES:=32}"
+FPS_MAX_FRAMES="${SFT_FPS_MAX_FRAMES}"
 
 mkdir -p "${OUT}"
-export PYTHONPATH="/home/ubuntu/go_viral:${PYTHONPATH:-}"
-# Reduce fragmentation; long-video ads cause variable allocation patterns.
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-MAX_PIXELS=49152 \
-VIDEO_MAX_PIXELS=49152 \
-FPS_MAX_FRAMES=32 \
-NPROC_PER_NODE=2 \
-CUDA_VISIBLE_DEVICES=0,1 \
+MAX_PIXELS="${MAX_PIXELS}" \
+VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS}" \
+FPS_MAX_FRAMES="${FPS_MAX_FRAMES}" \
+FPS="${FPS}" \
+NPROC_PER_NODE="${NPROC_PER_NODE}" \
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 "${VENV}/bin/python" -m swift.cli.main sft \
-    --model /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B \
+    --model "${MODEL}" \
     --tuner_type lora \
-    --lora_rank 16 \
-    --lora_alpha 32 \
+    --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" \
     --target_modules all-linear \
     --torch_dtype bfloat16 \
-    --dataset "${SFT_DATA}" \
-    --max_length 8192 \
-    --max_pixels 49152 \
-    --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 4 \
+    --dataset "${DATASET}" \
+    --max_length "${MAX_LENGTH}" --max_pixels "${MAX_PIXELS}" \
+    --num_train_epochs "${EPOCHS}" \
+    --per_device_train_batch_size "${PER_DEVICE_BS}" \
+    --gradient_accumulation_steps "${GRAD_ACCUM}" \
     --gradient_checkpointing true \
-    --learning_rate 1e-4 \
-    --warmup_ratio 0.05 \
-    --logging_steps 5 \
-    --eval_steps 50 \
-    --save_steps 50 \
-    --save_total_limit 3 \
+    --learning_rate "${LR}" --warmup_ratio "${WARMUP_RATIO}" \
+    --logging_steps "${LOGGING_STEPS}" \
+    --eval_steps "${SAVE_STEPS}" \
+    --save_steps "${SAVE_STEPS}" \
+    --save_total_limit "${SAVE_LIMIT}" \
     --output_dir "${OUT}" \
-    --deepspeed zero2 \
-    --dataloader_num_workers 2 \
+    --deepspeed zero2 --dataloader_num_workers 2 \
     2>&1 | tee "${OUT}/sft.log"
