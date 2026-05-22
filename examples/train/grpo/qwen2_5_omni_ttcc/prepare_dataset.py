@@ -163,60 +163,72 @@ def main():
     print(f"wrote GRPO dataset: {out_grpo}  ({n_grpo} rows)")
     print(f"wrote SFT  dataset: {out_sft}   ({n_sft} rows)")
 
-    # Also build a TEST-split dataset for post-training inference.
-    test_rows = []
+    # Build a JSONL for any held-out split (val + test). Same filters as train.
     DATA = WORK / "data/ttcc"
-    VIDEOS_TEST = WORK / "data/videos"
-    for shard in sorted((DATA / "data").glob("train-*-of-*.parquet")):
-        t = pq.read_table(
-            shard,
-            columns=["ad_id", "duration", "retention_curve", "split", "video_local_path"],
-        ).to_pandas()
-        t = t[t["split"] == "test"]
-        for _, row in t.iterrows():
-            raw = row["retention_curve"]
-            if raw is None or len(raw) == 0:
-                continue
-            c = np.asarray(raw, dtype=np.float64)
-            if not np.all(np.isfinite(c)) or c[0] <= 0:
-                continue
-            T = horizon(row["duration"], len(c))
-            if T is None:
-                continue
-            c = c[:T + 1] / c[0]
-            ok = True
-            for i in range(1, len(c)):
-                if c[i] > c[i - 1]:
-                    if c[i] - c[i - 1] > 5e-3:
-                        ok = False
-                        break
-                    c[i] = c[i - 1]
-            if not ok:
-                continue
-            ad_id = str(row["ad_id"])
-            mp4 = VIDEOS_TEST / f"{ad_id}.mp4"
-            if not mp4.exists():
-                v = row["video_local_path"]
-                if v is not None and v.get("bytes") is not None:
-                    mp4.write_bytes(bytes(v["bytes"]))
-            test_rows.append(
-                {"ad_id": ad_id, "T": T, "R": np.clip(c, 0, 1).tolist(), "mp4": str(mp4)}
-            )
+    VIDEOS_HOLDOUT = WORK / "data/videos"
+
+    def build_holdout_jsonl(split_name: str, out_path):
+        rows = []
+        for shard in sorted((DATA / "data").glob("train-*-of-*.parquet")):
+            t = pq.read_table(
+                shard,
+                columns=["ad_id", "duration", "retention_curve", "split", "video_local_path"],
+            ).to_pandas()
+            t = t[t["split"] == split_name]
+            for _, row in t.iterrows():
+                raw = row["retention_curve"]
+                if raw is None or len(raw) == 0:
+                    continue
+                c = np.asarray(raw, dtype=np.float64)
+                if not np.all(np.isfinite(c)) or c[0] <= 0:
+                    continue
+                T = horizon(row["duration"], len(c))
+                if T is None:
+                    continue
+                c = c[:T + 1] / c[0]
+                ok = True
+                for i in range(1, len(c)):
+                    if c[i] > c[i - 1]:
+                        if c[i] - c[i - 1] > 5e-3:
+                            ok = False
+                            break
+                        c[i] = c[i - 1]
+                if not ok:
+                    continue
+                ad_id = str(row["ad_id"])
+                mp4 = VIDEOS_HOLDOUT / f"{ad_id}.mp4"
+                if not mp4.exists():
+                    v = row["video_local_path"]
+                    if v is not None and v.get("bytes") is not None:
+                        mp4.write_bytes(bytes(v["bytes"]))
+                rows.append(
+                    {"ad_id": ad_id, "T": T, "R": np.clip(c, 0, 1).tolist(), "mp4": str(mp4)}
+                )
+
+        with open(out_path, "w") as f:
+            for r in rows:
+                f.write(json.dumps({
+                    "ad_id": r["ad_id"],
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_text(r["T"])},
+                    ],
+                    "videos": [r["mp4"]],
+                    "audios": [r["mp4"]],
+                    "T": r["T"],
+                    "R_true": r["R"],
+                }) + "\n")
+        return len(rows)
+
+    # val: model-selection split (~104 raw ads pre-filter)
+    out_val = args.out_dir / "ttcc_val.jsonl"
+    n_val = build_holdout_jsonl("val", out_val)
+    print(f"wrote VAL  dataset: {out_val}    ({n_val} rows)")
+
+    # test: final evaluation split; do NOT touch during training
     out_test = args.out_dir / "ttcc_test.jsonl"
-    with open(out_test, "w") as ft:
-        for r in test_rows:
-            ft.write(json.dumps({
-                "ad_id": r["ad_id"],
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text(r["T"])},
-                ],
-                "videos": [r["mp4"]],
-                "audios": [r["mp4"]],
-                "T": r["T"],
-                "R_true": r["R"],
-            }) + "\n")
-    print(f"wrote TEST dataset: {out_test}   ({len(test_rows)} rows)")
+    n_test = build_holdout_jsonl("test", out_test)
+    print(f"wrote TEST dataset: {out_test}   ({n_test} rows)")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ OUT="${OUT:-${WORK}/work-out/ttcc_sft_v2cot_full}"
 mkdir -p "${OUT}"
 export PYTHONPATH="/home/ubuntu/go_viral:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# Disable Talker (~833 M params we never use). Loads thinker-only.
+export ENABLE_AUDIO_OUTPUT="False"
 export WANDB_ENTITY="${WANDB_ENTITY:-liangyuch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-ttcc}"
 : "${WANDB_NAME:=$(basename "${OUT}")}"

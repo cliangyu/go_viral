@@ -37,3 +37,8 @@
 
 export PYTHONPATH="${TTCC_REPO}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+# Disable Talker (speech generation) + token2wav (vocoder) — we never use them.
+# Per ms-swift FAQ, this loads only the thinker submodule, freeing ~833 M params
+# (~1.5 GB at bf16) of GPU memory per device.
+export ENABLE_AUDIO_OUTPUT="False"
