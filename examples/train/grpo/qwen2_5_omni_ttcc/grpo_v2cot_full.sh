@@ -10,21 +10,22 @@ SFT_CKPT="${SFT_CKPT:?SFT_CKPT must be set (path to full-FT SFT checkpoint)}"
 : "${OUT:=/opt/dlami/nvme/ssm-out/ttcc_grpo_v2cot_full}"
 : "${EPOCHS:=1}"
 : "${LR:=5e-6}"
-: "${BETA:=0.04}"
-: "${NUM_GENERATIONS:=2}"
+: "${BETA:=0.001}"
+: "${NUM_GENERATIONS:=4}"
 : "${TEMPERATURE:=0.4}"
 : "${TOP_P:=0.95}"
-: "${MAX_COMPLETION_LENGTH:=384}"
+: "${MAX_COMPLETION_LENGTH:=1024}"
 : "${SAVE_STEPS:=50}"
 : "${SAVE_LIMIT:=3}"
 : "${LOGGING_STEPS:=2}"
 : "${REWARD_WEIGHTS:=1.0 0.2}"
 : "${VLLM_GPU_MEM_UTIL:=0.20}"
 
-# Visual config override (full-FT round): 4x pixels, 32 frames, larger token budget.
+# Visual config override (full-FT round): native pixels, 60 frames cover
+# all T_i in [5, 60] at FPS=1.0. See docs/06_config_audit.md.
 MAX_PIXELS=200704
 VIDEO_MAX_PIXELS=200704
-FPS_MAX_FRAMES=32
+FPS_MAX_FRAMES=60
 VIDEO_MAX_TOKEN_NUM=8192
 
 mkdir -p "${OUT}"

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SFT seed: train Qwen2.5-Omni-3B on the CoT-distilled TTCC dataset.
 #
-# Defaults: 1 epoch, FPS_MAX_FRAMES=32 (slightly more frames than infer/GRPO
-# to maximize visual context during gradient steps), cosine LR.
+# Defaults: 1 epoch, FPS=1.0 with FPS_MAX_FRAMES=60 (covers every T_i in
+# our test set without tail-truncation; see docs/06_config_audit.md),
+# cosine LR, audio_tower + visual encoder frozen so LoRA only attaches
+# to the text decoder.
 #
 # Overridable env vars (see _common.sh for the full set):
 #   DATASET     path to ms-swift JSONL
@@ -11,7 +13,7 @@
 #   LR          peak learning rate (cosine to 0 by end of training)
 #   SAVE_STEPS  save every N steps; controls --save_steps and --eval_steps
 #   SAVE_LIMIT  --save_total_limit
-#   FPS_MAX_FRAMES (default 32; lower it for FPS-limited variants)
+#   FPS_MAX_FRAMES  (default 60 from _common.sh; covers T_max=60 at FPS=1)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/_common.sh"
@@ -24,9 +26,6 @@ source "${HERE}/_common.sh"
 : "${SAVE_STEPS:=50}"
 : "${SAVE_LIMIT:=3}"
 : "${LOGGING_STEPS:=5}"
-# Default to a slightly more generous frame budget for SFT.
-: "${SFT_FPS_MAX_FRAMES:=32}"
-FPS_MAX_FRAMES="${SFT_FPS_MAX_FRAMES}"
 
 mkdir -p "${OUT}"
 
@@ -34,6 +33,7 @@ MAX_PIXELS="${MAX_PIXELS}" \
 VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS}" \
 FPS_MAX_FRAMES="${FPS_MAX_FRAMES}" \
 FPS="${FPS}" \
+VIDEO_MAX_TOKEN_NUM="${VIDEO_MAX_TOKEN_NUM}" \
 NPROC_PER_NODE="${NPROC_PER_NODE}" \
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 "${VENV}/bin/python" -m swift.cli.main sft \
@@ -41,6 +41,8 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
     --tuner_type lora \
     --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" \
     --target_modules all-linear \
+    --freeze_vit true \
+    --freeze_aligner true \
     --torch_dtype bfloat16 \
     --dataset "${DATASET}" \
     --max_length "${MAX_LENGTH}" --max_pixels "${MAX_PIXELS}" \

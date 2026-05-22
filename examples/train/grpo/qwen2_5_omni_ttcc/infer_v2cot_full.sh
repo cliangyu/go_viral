@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Eval a checkpoint on the TTCC test split. Visual config matches v2 full-FT
-# training: FPS_MAX_FRAMES=32, max_pixels=200704. Auto-detects LoRA vs full-FT.
+# training: FPS_MAX_FRAMES=60, max_pixels=200704. Auto-detects LoRA vs full-FT.
 #
 # Usage: bash infer_v2cot_full.sh <ckpt_path> <method_tag> <out_parquet>
 set -euo pipefail
@@ -21,7 +21,7 @@ fi
 TMP_JSONL="$(mktemp /tmp/ttcc_infer_XXXX.jsonl)"
 
 CUDA_VISIBLE_DEVICES=0,1 \
-FPS_MAX_FRAMES=32 FPS=1.0 \
+FPS_MAX_FRAMES=60 FPS=1.0 \
 MAX_PIXELS=200704 VIDEO_MAX_PIXELS=200704 \
 VIDEO_MAX_TOKEN_NUM=8192 \
 "${VENV}/bin/python" -m swift.cli.main infer \

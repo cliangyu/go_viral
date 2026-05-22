@@ -2,6 +2,7 @@
 # RLOO (REINFORCE Leave-One-Out) variant of GRPO.
 # Replaces the GRPO group advantage with the per-rollout leave-one-out
 # baseline; keeps every other hyperparameter identical to grpo.sh.
+# See docs/06_config_audit.md for the beta / num_generations rationale.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/_common.sh"
@@ -11,9 +12,10 @@ SFT_CKPT="${SFT_CKPT:?SFT_CKPT must be set}"
 : "${OUT:=${WORK}/work-out/ttcc_rloo}"
 : "${EPOCHS:=1}"
 : "${LR:=5e-6}"
-: "${BETA:=0.04}"
-: "${NUM_GENERATIONS:=2}"
+: "${BETA:=0.001}"
+: "${NUM_GENERATIONS:=4}"
 : "${TEMPERATURE:=0.4}"
+: "${MAX_COMPLETION_LENGTH:=1024}"
 : "${SAVE_STEPS:=25}"
 : "${SAVE_LIMIT:=2}"
 
@@ -23,6 +25,7 @@ MAX_PIXELS="${MAX_PIXELS}" \
 VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS}" \
 FPS_MAX_FRAMES="${FPS_MAX_FRAMES}" \
 FPS="${FPS}" \
+VIDEO_MAX_TOKEN_NUM="${VIDEO_MAX_TOKEN_NUM}" \
 NPROC_PER_NODE="${NPROC_PER_NODE}" \
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 "${VENV}/bin/python" -m swift.cli.main rlhf \
@@ -36,10 +39,12 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
     --tuner_type lora \
     --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" \
     --target_modules all-linear \
+    --freeze_vit true \
+    --freeze_aligner true \
     --torch_dtype bfloat16 --gradient_checkpointing true \
     --dataset "${GRPO_DATASET}" \
     --max_length "${MAX_LENGTH}" --max_pixels "${MAX_PIXELS}" \
-    --max_completion_length 384 \
+    --max_completion_length "${MAX_COMPLETION_LENGTH}" \
     --num_train_epochs "${EPOCHS}" \
     --per_device_train_batch_size "${PER_DEVICE_BS}" \
     --gradient_accumulation_steps "${GRAD_ACCUM}" \

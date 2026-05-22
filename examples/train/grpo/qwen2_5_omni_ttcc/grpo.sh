@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # GRPO with TTCC IBS reward on Qwen2.5-Omni-3B.
 #
-# vLLM colocate rollouts (~10x faster than HF), num_generations=2,
-# temperature=0.4 to stay near the SFT format.
+# Defaults follow docs/06_config_audit.md:
+#   - beta = 0.001   (DeepSeek-R1; was 0.04 -- 16x too strong KL pull)
+#   - num_generations = 4  (literature minimum; was 2)
+#   - max_completion_length = 1024  (was 384, observed 87% clipped)
+#   - audio_tower + visual frozen (--freeze_vit/--freeze_aligner true);
+#     LoRA attaches to the text decoder only
 #
 # Required env: SFT_CKPT — path to the SFT adapter to warm-start from.
 # Overridable env vars:
@@ -17,11 +21,11 @@ SFT_CKPT="${SFT_CKPT:?SFT_CKPT must be set (path to SFT adapter for warm-start)}
 : "${OUT:=${WORK}/work-out/ttcc_grpo}"
 : "${EPOCHS:=1}"
 : "${LR:=5e-6}"
-: "${BETA:=0.04}"
-: "${NUM_GENERATIONS:=2}"
+: "${BETA:=0.001}"
+: "${NUM_GENERATIONS:=4}"
 : "${TEMPERATURE:=0.4}"
 : "${TOP_P:=0.95}"
-: "${MAX_COMPLETION_LENGTH:=384}"
+: "${MAX_COMPLETION_LENGTH:=1024}"
 : "${SAVE_STEPS:=50}"
 : "${SAVE_LIMIT:=2}"
 : "${LOGGING_STEPS:=2}"
@@ -47,6 +51,8 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
     --tuner_type lora \
     --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" \
     --target_modules all-linear \
+    --freeze_vit true \
+    --freeze_aligner true \
     --torch_dtype bfloat16 --gradient_checkpointing true \
     --dataset "${GRPO_DATASET}" \
     --max_length "${MAX_LENGTH}" --max_pixels "${MAX_PIXELS}" \

@@ -23,10 +23,13 @@
 : "${WARMUP_RATIO:=0.05}"
 
 # Video preprocessing (passed as env vars to the swift CLI).
+#
+# FPS=1.0 + FPS_MAX_FRAMES=60: one frame per second covering all
+# T_i in [5, 60] without truncation. See docs/06_config_audit.md.
 : "${FPS:=1.0}"
-: "${FPS_MAX_FRAMES:=24}"
+: "${FPS_MAX_FRAMES:=60}"
 : "${VIDEO_MAX_PIXELS:=49152}"
-: "${VIDEO_MAX_TOKEN_NUM:=4096}"
+: "${VIDEO_MAX_TOKEN_NUM:=8192}"
 
 # Multi-GPU.
 : "${NPROC_PER_NODE:=2}"
