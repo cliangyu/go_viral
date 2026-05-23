@@ -10,7 +10,7 @@ Why this exists:
 Behavior:
   - Polls output_dir every --poll-sec seconds.
   - For each new checkpoint-* directory that contains a 'model.safetensors'
-    or *.bin shard AND a config.json, uploads via `huggingface-cli upload`.
+    or *.bin shard AND a config.json, uploads via `hf upload`.
   - Each upload becomes a HF commit. Repo grows monotonically; HF stores
     full history.
   - Only uploads checkpoints that ms-swift has finished writing
@@ -50,7 +50,7 @@ def upload_one(ckpt_dir: Path, repo: str) -> bool:
     ckpt_name = ckpt_dir.name        # e.g. "checkpoint-200"
     remote_path = f"{run_name}/{ckpt_name}"
     cmd = [
-        "huggingface-cli", "upload", repo, str(ckpt_dir), remote_path,
+        "/opt/dlami/nvme/work/swift_venv/bin/hf", "upload", repo, str(ckpt_dir), remote_path,
         "--commit-message", f"sft ckpt: {run_name}/{ckpt_name}",
         "--repo-type", "model",
     ]
