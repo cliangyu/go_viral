@@ -1,0 +1,40 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/conditional_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_v2/submission.parquet:SFT-MSE-v2-42 /vol/runs/sft_mse/seed43_v2/submission.parquet:SFT-MSE-v2-43 /vol/runs/sft_mse/seed44_v2/submission.parquet:SFT-MSE-v2-44 /vol/runs/sft_hazard_cot/seed42_a0.1_v2/submission.parquet:SFT-CoT-v2-42 /vol/runs/sft_hazard_cot/seed43_a0.1_v2/submission.parquet:SFT-CoT-v2-43 /vol/runs/sft_hazard_cot/seed44_a0.1_v2/submission.parquet:SFT-CoT-v2-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl --subset all --ref B1
+--- stdout ---
+  B1: 87 ads in subset all
+  B0: 87 ads in subset all
+  B2: 87 ads in subset all
+  SFT-MSE-v2-42: 87 ads in subset all
+  SFT-MSE-v2-43: 87 ads in subset all
+  SFT-MSE-v2-44: 87 ads in subset all
+  SFT-CoT-v2-42: 87 ads in subset all
+  SFT-CoT-v2-43: 87 ads in subset all
+  SFT-CoT-v2-44: 87 ads in subset all
+
+=== subset=all  n=87 ads ===
+
+method       | mean IBS   | calib slope  | n_parsed 
+------------------------------------------------------------
+B1           | 0.0083     | +1.001        | 87
+B0           | 0.1774     | +1.835        | 87
+B2           | 0.2082     | +0.329        | 87
+SFT-MSE-v2-42 | 0.1290     | +0.276        | 87
+SFT-MSE-v2-43 | 0.1189     | +0.305        | 87
+SFT-MSE-v2-44 | 0.1357     | +0.291        | 87
+SFT-CoT-v2-42 | 0.0183     | +0.868        | 87
+SFT-CoT-v2-43 | 0.0076     | +0.938        | 87
+SFT-CoT-v2-44 | 0.0078     | +0.971        | 87
+
+Paired BCa ΔIBS vs B1 (negative = better than B1, CI excluding 0 = significant):
+  B0           n= 87  Δ=+0.1691  CI95=[+0.1584, +0.1776]  ✓ excludes 0
+  B2           n= 87  Δ=+0.1999  CI95=[+0.1853, +0.2124]  ✓ excludes 0
+  SFT-MSE-v2-42 n= 87  Δ=+0.1206  CI95=[+0.0923, +0.1487]  ✓ excludes 0
+  SFT-MSE-v2-43 n= 87  Δ=+0.1105  CI95=[+0.0848, +0.1377]  ✓ excludes 0
+  SFT-MSE-v2-44 n= 87  Δ=+0.1273  CI95=[+0.0990, +0.1556]  ✓ excludes 0
+  SFT-CoT-v2-42 n= 87  Δ=+0.0099  CI95=[+0.0068, +0.0133]  ✓ excludes 0
+  SFT-CoT-v2-43 n= 87  Δ=-0.0007  CI95=[-0.0020, +0.0007]  ~ tied
+  SFT-CoT-v2-44 n= 87  Δ=-0.0006  CI95=[-0.0022, +0.0014]  ~ tied
+
+--- stderr ---
+
+--- returncode ---
+0

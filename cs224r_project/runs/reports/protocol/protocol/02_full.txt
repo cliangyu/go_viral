@@ -1,0 +1,45 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/full_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_strict/submission.parquet:SFT-MSE-42 /vol/runs/sft_mse/seed43_strict/submission.parquet:SFT-MSE-43 /vol/runs/sft_mse/seed44_strict/submission.parquet:SFT-MSE-44 /vol/runs/sft_hazard_cot/seed42_a0.1_strict/submission.parquet:SFT-CoT-42 /vol/runs/sft_hazard_cot/seed43_a0.1_strict/submission.parquet:SFT-CoT-43 /vol/runs/sft_hazard_cot/seed44_a0.1_strict/submission.parquet:SFT-CoT-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl
+--- stdout ---
+
+=== n_test=87, bins=10 ===
+
+method         | n_par | IBS       | BSS     | slope   | REL     | RES     | UNC     | BSS_mu  | decomp_Δ 
+--------------------------------------------------------------------------------------------------------------
+B1             |    87 | 0.00833  | +0.000   | +1.001   | 0.0002 | 0.0296 | 0.0366 | +0.802    | +0.000223
+B0             |    87 | 0.17743  | -20.297   | +1.835   | 0.1690 | 0.0257 | 0.0366 | -3.912    | +0.000000
+B2             |    87 | 0.20820  | -23.990   | +0.329   | 0.2008 | 0.0176 | 0.0366 | -5.002    | +0.001663
+SFT-MSE-42     |    87 | 0.16924  | -19.314   | +0.209   | 0.1101 | 0.0082 | 0.0366 | -2.781    | +0.001336
+SFT-MSE-43     |    87 | 0.18498  | -21.204   | +0.166   | 0.1410 | 0.0058 | 0.0366 | -3.693    | +0.001173
+SFT-MSE-44     |    87 | 0.16024  | -18.233   | +0.234   | 0.0975 | 0.0089 | 0.0366 | -2.420    | +0.001072
+SFT-CoT-42     |    87 | 0.00874  | -0.049   | +0.939   | 0.0015 | 0.0293 | 0.0366 | +0.758    | +0.000246
+SFT-CoT-43     |    87 | 0.01274  | -0.529   | +0.824   | 0.0047 | 0.0292 | 0.0366 | +0.668    | +0.000539
+SFT-CoT-44     |    87 | 0.01130  | -0.356   | +0.954   | 0.0050 | 0.0284 | 0.0366 | +0.637    | +0.000715
+
+=== sanity checks ===
+BSS(B1) ≈ 0:            ✓
+UNC method-invariant:   ✓  (range 0.036621-0.036621)
+Murphy decomp residual: ✗  (REL−RES+UNC≈IBS for all methods)
+BSS by ratio vs Murphy: by construction these differ when IBS_B1 ≠ UNC; both reported above
+
+=== paired BCa ΔIBS vs B1 (n=87 ads, B=10000) ===
+  B0             n= 87  ΔIBS=+0.16909  CI95=[+0.15841, +0.17762]  ✓ excludes 0
+                    BSS_CI ≈ [-21.320, -19.014]
+  B2             n= 87  ΔIBS=+0.19987  CI95=[+0.18534, +0.21236]  ✓ excludes 0
+                    BSS_CI ≈ [-25.490, -22.246]
+  SFT-MSE-42     n= 87  ΔIBS=+0.16091  CI95=[+0.13854, +0.18399]  ✓ excludes 0
+                    BSS_CI ≈ [-22.085, -16.630]
+  SFT-MSE-43     n= 87  ΔIBS=+0.17665  CI95=[+0.16338, +0.19273]  ✓ excludes 0
+                    BSS_CI ≈ [-23.134, -19.611]
+  SFT-MSE-44     n= 87  ΔIBS=+0.15190  CI95=[+0.12708, +0.17677]  ✓ excludes 0
+                    BSS_CI ≈ [-21.217, -15.254]
+  SFT-CoT-42     n= 87  ΔIBS=+0.00041  CI95=[-0.00113, +0.00223]  ~ tied
+                    BSS_CI ≈ [-0.268, +0.136]
+  SFT-CoT-43     n= 87  ΔIBS=+0.00441  CI95=[+0.00331, +0.00580]  ✓ excludes 0
+                    BSS_CI ≈ [-0.696, -0.397]
+  SFT-CoT-44     n= 87  ΔIBS=+0.00296  CI95=[-0.00002, +0.00645]  ~ tied
+                    BSS_CI ≈ [-0.774, +0.002]
+
+--- stderr ---
+
+--- returncode ---
+0

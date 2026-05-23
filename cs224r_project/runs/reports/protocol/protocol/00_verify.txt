@@ -1,0 +1,115 @@
+$ ttcc-eval verify
+--- stdout ---
+{
+  "split": "test",
+  "n_ads_evaluated": 88,
+  "n_ads_missing_prediction": 0,
+  "preprocess": {
+    "n_input": 89,
+    "n_kept": 88,
+    "n_dropped": 1,
+    "dropped_by_reason": {
+      "non_positive_R0": 1
+    },
+    "n_monotonicity_smoothed": 0,
+    "dropped_samples": {
+      "non_positive_R0": [
+        "7498907768448565265"
+      ]
+    }
+  },
+  "metrics": {
+    "ibs": {
+      "point": 0.0,
+      "lo": 0.0,
+      "hi": 0.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "calibration_slope": {
+      "point": 1.0,
+      "lo": 1.0,
+      "hi": 1.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "auc_spearman": {
+      "point": 1.0,
+      "lo": 1.0,
+      "hi": 1.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "hook_spearman": {
+      "point": 1.0,
+      "lo": 1.0,
+      "hi": 1.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "completion_spearman": {
+      "point": 1.0,
+      "lo": 1.0,
+      "hi": 1.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "shape_spearman_mean": {
+      "point": 1.0,
+      "lo": 1.0,
+      "hi": 1.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "hook_mae": {
+      "point": 0.0,
+      "lo": 0.0,
+      "hi": 0.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    },
+    "completion_mae": {
+      "point": 0.0,
+      "lo": 0.0,
+      "hi": 0.0,
+      "alpha": 0.05,
+      "B": 200,
+      "z0": -2.8070337683438042,
+      "a": 0.0,
+      "n_resamples_used": 200
+    }
+  },
+  "predictions_meta": {
+    "path": "/tmp/tmpdhgr1po4/truth_as_preds.parquet",
+    "method": "ground_truth",
+    "seed": 0,
+    "T_HOOK": 3
+  }
+}
+
+--- stderr ---
+VERIFIER PASS  n_ads=88
+
+--- returncode ---
+0

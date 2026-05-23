@@ -1,0 +1,32 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/rmst_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_v2/submission.parquet:SFT-MSE-v2-42 /vol/runs/sft_mse/seed43_v2/submission.parquet:SFT-MSE-v2-43 /vol/runs/sft_mse/seed44_v2/submission.parquet:SFT-MSE-v2-44 /vol/runs/sft_hazard_cot/seed42_a0.1_v2/submission.parquet:SFT-CoT-v2-42 /vol/runs/sft_hazard_cot/seed43_a0.1_v2/submission.parquet:SFT-CoT-v2-43 /vol/runs/sft_hazard_cot/seed44_a0.1_v2/submission.parquet:SFT-CoT-v2-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl
+--- stdout ---
+
+True RMST distribution (n=87 ads):
+  mean = 3.01s,  median = 1.99s,  range = [0.71, 12.45]s
+
+method         |  MAE (s) |  MAE Δ vs B1 | Spearman ρ |  C-index | n_par
+--------------------------------------------------------------------------------
+B1             |   1.813s |          ref |     +0.657 |    0.736 |    87
+B0             |  12.600s |      +10.787 |     +0.657 |    0.736 |    87
+B2             |  12.350s |      +10.537 |     +0.657 |    0.736 |    87
+SFT-MSE-v2-42  |   4.783s |       +2.971 |     +0.152 |    0.551 |    87
+SFT-MSE-v2-43  |   4.768s |       +2.956 |     +0.183 |    0.554 |    87
+SFT-MSE-v2-44  |   4.986s |       +3.173 |     +0.148 |    0.545 |    87
+SFT-CoT-v2-42  |   2.640s |       +0.827 |     +0.661 |    0.731 |    87
+SFT-CoT-v2-43  |   1.588s |       -0.225 |     +0.558 |    0.694 |    87
+SFT-CoT-v2-44  |   1.612s |       -0.200 |     +0.608 |    0.715 |    87
+
+Paired BCa Δ-MAE vs B1 (n=87):
+  B0             ΔMAE=+10.787s  CI95=[+9.287, +12.421]s  ✓
+  B2             ΔMAE=+10.537s  CI95=[+9.037, +12.171]s  ✓
+  SFT-MSE-v2-42  ΔMAE=+2.971s  CI95=[+2.130, +4.074]s  ✓
+  SFT-MSE-v2-43  ΔMAE=+2.956s  CI95=[+2.103, +4.056]s  ✓
+  SFT-MSE-v2-44  ΔMAE=+3.173s  CI95=[+2.336, +4.163]s  ✓
+  SFT-CoT-v2-42  ΔMAE=+0.827s  CI95=[+0.504, +1.137]s  ✓
+  SFT-CoT-v2-43  ΔMAE=-0.225s  CI95=[-0.504, +0.074]s  ~ tied
+  SFT-CoT-v2-44  ΔMAE=-0.200s  CI95=[-0.520, +0.140]s  ~ tied
+
+--- stderr ---
+
+--- returncode ---
+0

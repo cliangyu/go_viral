@@ -1,0 +1,69 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_v2/submission.parquet:SFT-MSE-v2-42 /vol/runs/sft_mse/seed43_v2/submission.parquet:SFT-MSE-v2-43 /vol/runs/sft_mse/seed44_v2/submission.parquet:SFT-MSE-v2-44 /vol/runs/sft_hazard_cot/seed42_a0.1_v2/submission.parquet:SFT-CoT-v2-42 /vol/runs/sft_hazard_cot/seed43_a0.1_v2/submission.parquet:SFT-CoT-v2-43 /vol/runs/sft_hazard_cot/seed44_a0.1_v2/submission.parquet:SFT-CoT-v2-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl --train-gt /vol/data/splits/train_minimal_eval.jsonl
+--- stdout ---
+thresholds from train (median): hook R(3)>0.137, completion R(T)>0.024
+  B1: 87 ads
+  B0: 87 ads
+  B2: 87 ads
+  SFT-MSE-v2-42: 87 ads
+  SFT-MSE-v2-43: 87 ads
+  SFT-MSE-v2-44: 87 ads
+  SFT-CoT-v2-42: 87 ads
+  SFT-CoT-v2-43: 87 ads
+  SFT-CoT-v2-44: 87 ads
+
+=== HOOK RATE  R(3) — Meta convention ===
+
+method       | MSE        | Spearman ρ | AUC(strong)  | n   
+-----------------------------------------------------------------
+B1           | 0.0200     | +nan      | 0.000        | 87
+B0           | 0.1318     | +nan      | 0.000        | 87
+B2           | 0.4886     | +0.436      | 0.673        | 87
+SFT-MSE-v2-42 | 0.0687     | +0.039      | 0.507        | 87
+SFT-MSE-v2-43 | 0.2055     | -0.158      | 0.454        | 87
+SFT-MSE-v2-44 | 0.1172     | +0.002      | 0.508        | 87
+SFT-CoT-v2-42 | 0.0578     | +0.311      | 0.621        | 87
+SFT-CoT-v2-43 | 0.0208     | +0.184      | 0.547        | 87
+SFT-CoT-v2-44 | 0.0219     | +0.297      | 0.630        | 87
+
+Paired BCa hook-MSE Δ vs B1:
+  B0           n= 87  Δ=+0.11179  CI95=[+0.09138, +0.12779]  ✓
+  B2           n= 87  Δ=+0.46857  CI95=[+0.42440, +0.50724]  ✓
+  SFT-MSE-v2-42 n= 87  Δ=+0.04868  CI95=[+0.02519, +0.08642]  ✓
+  SFT-MSE-v2-43 n= 87  Δ=+0.18554  CI95=[+0.13019, +0.25100]  ✓
+  SFT-MSE-v2-44 n= 87  Δ=+0.09723  CI95=[+0.06370, +0.14243]  ✓
+  SFT-CoT-v2-42 n= 87  Δ=+0.03777  CI95=[+0.02573, +0.04891]  ✓
+  SFT-CoT-v2-43 n= 87  Δ=+0.00081  CI95=[-0.00318, +0.00635]  ~ tied
+  SFT-CoT-v2-44 n= 87  Δ=+0.00185  CI95=[-0.00238, +0.00738]  ~ tied
+
+=== COMPLETION RATE  R(T_i) ===
+
+method       | MSE        | Spearman ρ | AUC(strong)  | n   
+-----------------------------------------------------------------
+B1           | 0.0027     | -0.029      | 0.459        | 87
+B0           | 0.2202     | +nan      | 0.000        | 87
+B2           | 0.0021     | +nan      | 0.000        | 87
+SFT-MSE-v2-42 | 0.1668     | +0.081      | 0.521        | 87
+SFT-MSE-v2-43 | 0.1716     | +0.080      | 0.554        | 87
+SFT-MSE-v2-44 | 0.1602     | +0.019      | 0.510        | 87
+SFT-CoT-v2-42 | 0.0046     | +0.066      | 0.542        | 87
+SFT-CoT-v2-43 | 0.0014     | -0.005      | 0.481        | 87
+SFT-CoT-v2-44 | 0.0015     | -0.016      | 0.503        | 87
+
+Paired BCa completion-MSE Δ vs B1:
+  B0           n= 87  Δ=+0.21754  CI95=[+0.21030, +0.22267]  ✓
+  B2           n= 87  Δ=-0.00057  CI95=[-0.00151, +0.00061]  ~ tied
+  SFT-MSE-v2-42 n= 87  Δ=+0.16411  CI95=[+0.11061, +0.22712]  ✓
+  SFT-MSE-v2-43 n= 87  Δ=+0.16888  CI95=[+0.11766, +0.23622]  ✓
+  SFT-MSE-v2-44 n= 87  Δ=+0.15755  CI95=[+0.11051, +0.21645]  ✓
+  SFT-CoT-v2-42 n= 87  Δ=+0.00191  CI95=[+0.00113, +0.00306]  ✓
+  SFT-CoT-v2-43 n= 87  Δ=-0.00124  CI95=[-0.00197, -0.00040]  ✓
+  SFT-CoT-v2-44 n= 87  Δ=-0.00118  CI95=[-0.00194, -0.00029]  ✓
+
+--- stderr ---
+/root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py:150: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  rho, _ = spearmanr(hat, tru)
+/root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py:183: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  rho, _ = spearmanr(hat, tru)
+
+--- returncode ---
+0

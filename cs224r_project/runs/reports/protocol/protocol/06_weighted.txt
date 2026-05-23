@@ -1,0 +1,42 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/weighted_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_strict/submission.parquet:SFT-MSE-42 /vol/runs/sft_mse/seed43_strict/submission.parquet:SFT-MSE-43 /vol/runs/sft_mse/seed44_strict/submission.parquet:SFT-MSE-44 /vol/runs/sft_hazard_cot/seed42_a0.1_strict/submission.parquet:SFT-CoT-42 /vol/runs/sft_hazard_cot/seed43_a0.1_strict/submission.parquet:SFT-CoT-43 /vol/runs/sft_hazard_cot/seed44_a0.1_strict/submission.parquet:SFT-CoT-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl
+--- stdout ---
+n=87, nu: mean=0.0083, median=0.0049, std=0.0100, max=0.0624
+
+=== mean-weighted IBS by scheme ===
+
+scheme                    | B1             | B1             | B0             | B2             | SFT-MSE-42     | SFT-MSE-43     | SFT-MSE-44     | SFT-CoT-42     | SFT-CoT-43     | SFT-CoT-44    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+A. novelty                | 0.02039        | 0.02039        | 0.15505        | 0.17168        | 0.16998        | 0.18421        | 0.16695        | 0.02466        | 0.02870        | 0.02935       
+B. centered               | 0.01685        | 0.01685        | 0.15606        | 0.17636        | 0.15820        | 0.17238        | 0.15092        | 0.02210        | 0.02408        | 0.02777       
+C. gaussian               | 0.00525        | 0.00525        | 0.18332        | 0.21793        | 0.16926        | 0.18617        | 0.15793        | 0.00475        | 0.00848        | 0.00708       
+plain (unweighted)        | 0.00833        | 0.00833        | 0.17743        | 0.20820        | 0.16924        | 0.18498        | 0.16024        | 0.00874        | 0.01274        | 0.01130       
+
+=== scheme A: paired BCa Δ vs B1 (n=87, weighted mean of (IBS_m - IBS_B1) by w_i) ===
+
+  B1             Δ_novelty-weighted = +0.00000  CI95=[+0.00000, +0.00000]  ~ tied
+  B0             Δ_novelty-weighted = +0.13466  CI95=[+0.11043, +0.16393]  ✓
+  B2             Δ_novelty-weighted = +0.15129  CI95=[+0.12290, +0.18371]  ✓
+  SFT-MSE-42     Δ_novelty-weighted = +0.14959  CI95=[+0.11529, +0.19425]  ✓
+  SFT-MSE-43     Δ_novelty-weighted = +0.16382  CI95=[+0.13185, +0.20496]  ✓
+  SFT-MSE-44     Δ_novelty-weighted = +0.14656  CI95=[+0.10861, +0.19835]  ✓
+  SFT-CoT-42     Δ_novelty-weighted = +0.00427  CI95=[-0.00054, +0.01434]  ~ tied
+  SFT-CoT-43     Δ_novelty-weighted = +0.00831  CI95=[+0.00501, +0.01398]  ✓
+  SFT-CoT-44     Δ_novelty-weighted = +0.00896  CI95=[-0.00069, +0.02915]  ~ tied
+
+=== scheme D: excess-skill (per-ad 1 - IBS_m / max(IBS_B1, eps)) ===
+
+method         |       mean |     median |     frac>0 (% ads where method beats B1)
+B1             | +0.0000    | +0.0000    | 0.0%
+B0             | -97.0507    | -41.3028    | 1.1%
+B2             | -119.1707    | -45.5469    | 1.1%
+SFT-MSE-42     | -71.3802    | -30.0846    | 0.0%
+SFT-MSE-43     | -83.2307    | -36.3000    | 0.0%
+SFT-MSE-44     | -65.6243    | -22.9539    | 0.0%
+SFT-CoT-42     | -0.7947    | +0.1708    | 56.3%
+SFT-CoT-43     | -2.1729    | -0.4655    | 21.8%
+SFT-CoT-44     | -2.9352    | +0.1430    | 50.6%
+
+--- stderr ---
+
+--- returncode ---
+0

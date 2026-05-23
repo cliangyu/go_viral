@@ -1,0 +1,69 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_strict/submission.parquet:SFT-MSE-42 /vol/runs/sft_mse/seed43_strict/submission.parquet:SFT-MSE-43 /vol/runs/sft_mse/seed44_strict/submission.parquet:SFT-MSE-44 /vol/runs/sft_hazard_cot/seed42_a0.1_strict/submission.parquet:SFT-CoT-42 /vol/runs/sft_hazard_cot/seed43_a0.1_strict/submission.parquet:SFT-CoT-43 /vol/runs/sft_hazard_cot/seed44_a0.1_strict/submission.parquet:SFT-CoT-44 --b1-preds /vol/runs/B1_mean_train_curve/submission.parquet --gt /vol/data/splits/test_minimal_eval.jsonl --train-gt /vol/data/splits/train_minimal_eval.jsonl
+--- stdout ---
+thresholds from train (median): hook R(3)>0.137, completion R(T)>0.024
+  B1: 87 ads
+  B0: 87 ads
+  B2: 87 ads
+  SFT-MSE-42: 87 ads
+  SFT-MSE-43: 87 ads
+  SFT-MSE-44: 87 ads
+  SFT-CoT-42: 87 ads
+  SFT-CoT-43: 87 ads
+  SFT-CoT-44: 87 ads
+
+=== HOOK RATE  R(3) — Meta convention ===
+
+method       | MSE        | Spearman ρ | AUC(strong)  | n   
+-----------------------------------------------------------------
+B1           | 0.0200     | +nan      | 0.000        | 87
+B0           | 0.1318     | +nan      | 0.000        | 87
+B2           | 0.4886     | +0.436      | 0.673        | 87
+SFT-MSE-42   | 0.1006     | -0.074      | 0.471        | 87
+SFT-MSE-43   | 0.2289     | -0.275      | 0.418        | 87
+SFT-MSE-44   | 0.1239     | -0.227      | 0.387        | 87
+SFT-CoT-42   | 0.0206     | +0.148      | 0.534        | 87
+SFT-CoT-43   | 0.0231     | -0.071      | 0.473        | 87
+SFT-CoT-44   | 0.0371     | +0.362      | 0.698        | 87
+
+Paired BCa hook-MSE Δ vs B1:
+  B0           n= 87  Δ=+0.11179  CI95=[+0.09138, +0.12779]  ✓
+  B2           n= 87  Δ=+0.46857  CI95=[+0.42440, +0.50724]  ✓
+  SFT-MSE-42   n= 87  Δ=+0.08054  CI95=[+0.05327, +0.11436]  ✓
+  SFT-MSE-43   n= 87  Δ=+0.20890  CI95=[+0.14941, +0.27456]  ✓
+  SFT-MSE-44   n= 87  Δ=+0.10389  CI95=[+0.07166, +0.15064]  ✓
+  SFT-CoT-42   n= 87  Δ=+0.00056  CI95=[-0.00241, +0.00453]  ~ tied
+  SFT-CoT-43   n= 87  Δ=+0.00304  CI95=[-0.00126, +0.00962]  ~ tied
+  SFT-CoT-44   n= 87  Δ=+0.01709  CI95=[+0.00900, +0.02753]  ✓
+
+=== COMPLETION RATE  R(T_i) ===
+
+method       | MSE        | Spearman ρ | AUC(strong)  | n   
+-----------------------------------------------------------------
+B1           | 0.0027     | -0.029      | 0.459        | 87
+B0           | 0.2202     | +nan      | 0.000        | 87
+B2           | 0.0021     | +nan      | 0.000        | 87
+SFT-MSE-42   | 0.2271     | -0.098      | 0.429        | 87
+SFT-MSE-43   | 0.2501     | -0.114      | 0.447        | 87
+SFT-MSE-44   | 0.2058     | -0.024      | 0.502        | 87
+SFT-CoT-42   | 0.0019     | -0.026      | 0.483        | 87
+SFT-CoT-43   | 0.0021     | -0.025      | 0.479        | 87
+SFT-CoT-44   | 0.0021     | -0.045      | 0.477        | 87
+
+Paired BCa completion-MSE Δ vs B1:
+  B0           n= 87  Δ=+0.21754  CI95=[+0.21030, +0.22267]  ✓
+  B2           n= 87  Δ=-0.00057  CI95=[-0.00151, +0.00061]  ~ tied
+  SFT-MSE-42   n= 87  Δ=+0.22438  CI95=[+0.17616, +0.28086]  ✓
+  SFT-MSE-43   n= 87  Δ=+0.24745  CI95=[+0.19395, +0.30942]  ✓
+  SFT-MSE-44   n= 87  Δ=+0.20317  CI95=[+0.14890, +0.26701]  ✓
+  SFT-CoT-42   n= 87  Δ=-0.00076  CI95=[-0.00154, +0.00015]  ~ tied
+  SFT-CoT-43   n= 87  Δ=-0.00056  CI95=[-0.00147, +0.00060]  ~ tied
+  SFT-CoT-44   n= 87  Δ=-0.00059  CI95=[-0.00153, +0.00059]  ~ tied
+
+--- stderr ---
+/root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py:150: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  rho, _ = spearmanr(hat, tru)
+/root/cs224r_project/third_party/ttcc-eval/scripts/segment_eval.py:183: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  rho, _ = spearmanr(hat, tru)
+
+--- returncode ---
+0

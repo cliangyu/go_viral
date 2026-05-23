@@ -1,0 +1,89 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.5in]{geometry}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=1em,topsep=1pt,parsep=0pt,partopsep=0pt}
+\titlespacing*{\section}{0pt}{2pt}{1pt}
+\titleformat{\section}{\small\bfseries}{\thesection}{0.4em}{}
+\pagestyle{empty}
+\linespread{0.94}
+\setlength{\parskip}{1pt}
+\setlength{\parindent}{0pt}
+
+\begin{document}
+{\centering\normalsize\textbf{CS224R Milestone: SFT Baselines for Per-Second Retention Prediction}\\
+\footnotesize Wanjia Zhao (SFT) \,;\, Liangyu Chen (GRPO + eval infra) \,;\, May 2026\par}
+\vspace{1pt}
+
+\section*{Task \& Setup}
+Predict per-second retention $R(t)\!\in\![0,1]$ for short-form video ads.
+Backbone: \textbf{Qwen2.5-Omni-3B Thinker} (Talker disabled), PEFT \textbf{LoRA} (r=8, $\alpha$=32, all-linear)
+with post-LoRA freeze of visual/audio/merger params (15.1M/4.73B trainable = 0.32\%).
+Hparams aligned to Liangyu's \texttt{sft\_v2cot\_full.sh} (``v2''):
+\texttt{max\_pixels=200704}, \texttt{nframes=32}, \texttt{max\_length=8192}, batch=1$\times$16 grad-accum,
+lr=1e-5, bf16, gradient checkpointing, \textbf{10 epochs}, 3 seeds $\{42,43,44\}$.
+Eval: \textbf{ttcc-eval} canonical 8-script protocol; paired BCa CIs at $B$=10K vs reference baseline
+\textbf{B1}=train-mean curve (climatology, Mason 2004). Test $n$=87 ads.
+
+\section*{Methods}
+\textbf{Sanity}: B0=const 0.5; B1=train-mean curve; B2=$1-t/T_i$.\quad
+\textbf{Stage 1 SFT-MSE} (\S5): sigmoid head on last non-pad hidden state, MSE on $R(t)$ -- literature baseline.\quad
+\textbf{Stage 2 SFT-Hazard+CoT} (\S6): softplus hazard head on \texttt{</cot>} hidden state, curve via $\exp(-\!\sum_s\!\lambda_s)$,
+loss $L_\text{hazard}+0.1\!\cdot\!L_\text{CoT}$. CoT distilled from \texttt{liangyuch/ttcc-cot} (Qwen3-Omni-30B, 717 train ads).
+
+\section*{Headline Results (v2, $n=87$)}
+\vspace{-2pt}
+{\footnotesize
+\begin{tabular}{lrrrrr}
+\toprule
+Method & IBS $\downarrow$ & BS(3) & $\rho_H$ & BS$_\text{end}$ & $\rho_C$ \\
+\midrule
+B0 (constant 0.5)        & 0.1774 & 0.1318 & n/a    & 0.2202 & n/a \\
+\textbf{B1 (train-mean)} & \textbf{0.0083} & \textbf{0.0200} & n/a & \textbf{0.0027} & $-$0.029 \\
+B2 ($1-t/T_i$)           & 0.2082 & 0.4886 & +0.436 & 0.0021 & n/a \\
+SFT-MSE-v2-\{42,43,44\}  & 0.129/0.119/0.136 & 0.069/0.206/0.117 & +0.04/$-$0.16/+0.00 & 0.167/0.172/0.160 & +0.08/+0.08/+0.02 \\
+SFT-CoT-v2-42            & 0.0183 & 0.0578 & +0.311 & 0.0046 & +0.066 \\
+\textbf{SFT-CoT-v2-43}   & \textbf{0.0076} & 0.0208 & +0.184 & \textbf{0.0014} & $-$0.005 \\
+\textbf{SFT-CoT-v2-44}   & \textbf{0.0078} & 0.0219 & \textbf{+0.297} & \textbf{0.0015} & $-$0.016 \\
+\bottomrule
+\end{tabular}}
+
+\textbf{Paired BCa significance vs B1} (10K bootstrap):
+\begin{itemize}
+\item Unconditional IBS: v2-43 $\Delta=-0.0007$ [$-0.0020,+0.0007$]; v2-44 $\Delta=-0.0006$ [$-0.0022,+0.0014$] -- \textbf{tied with B1}.
+\item Q2Q3 subset ($n$=43): v2-43 $-0.0021$ [$-0.0028,-0.0011$]; v2-44 $-0.0026$ [$-0.0036,-0.0011$] -- \textbf{SFT-CoT beats B1}.
+\item Completion MSE: v2-43 $-0.0012$ [$-0.0020,-0.0004$]; v2-44 $-0.0012$ [$-0.0019,-0.0003$] -- \textbf{SFT-CoT beats B1}.
+\item RMST MAE: v2-43 $-0.225$s, v2-44 $-0.200$s vs B1 (directional). \% ads beating B1: 64.4\% / 62.1\%.
+Drop-localization $\pm$1s: 100\% / 100\% (vs SFT-MSE 47--53\%).
+\end{itemize}
+
+\section*{Failure-Mode Diagnosis (per-method, $R_\text{hat}(1)$ dispersion + bias + variance)}
+\begin{itemize}
+\item \textbf{B1}: $R_\text{hat}(1)$ std $=0$ -- complete mode collapse (by design; one shared curve).
+\item \textbf{SFT-MSE-v2-43}: $R_\text{hat}(1)$ std $=0.218$ (near true 0.198; \emph{not} mode collapse) but mean bias $=+0.192$
+(systematic over-prediction), per-ad variance $0.066$ (jagged non-monotone) -- sigmoid head with no monotonicity prior
+cannot recover smooth $R(t)$ from 717 ads. Loses to B1 by an order of magnitude (BSS$\approx-14$), as \S5 predicts.
+\item \textbf{SFT-CoT-v2-43}: $R_\text{hat}(1)$ std $=0.065$ ($\approx\tfrac{1}{3}$ of true) -- partial mode collapse / regression to mean;
+bias $\approx -0.02$ (balanced 51.7\%/48.3\% over/under), per-ad variance $0.044$ (smooth monotone, hazard parameterization works).
+``Safe middling'' predictions $\Rightarrow$ tied on unconditional IBS, win on Q2Q3 where $R(1)$ is closer to marginal.
+\end{itemize}
+
+\section*{Alignment with Milestone PDF Expectations}
+\begin{itemize}
+\item \S5 SFT-MSE = ``weakest, literature baseline'': all v2 seeds lose to B1 by $\Delta\text{IBS}\!\approx\!0.12$, BSS $\in[-15,-13]$. \textbf{Consistent.}
+\item \S6 SFT-Hazard+CoT = ``starting point for RL'' (reasonable, not SOTA): 2/3 seeds point-IBS $<$ B1, CIs tying at 95\%;
+significantly beats B1 on Q2Q3 + completion MSE; BSS $+0.07$--$0.09$; drop-localization 100\%; hook $\rho_H=+0.30$. \textbf{Stronger than expected.}
+\item \S6 architecture (softplus hazard on \texttt{</cot>}, cumsum$\to$exp, monotone): implemented; ttcc-eval identity check passes. \textbf{Pass.}
+\item Cross-seed std $<\tfrac{1}{3}$ pairwise method delta (\S9 sanity): Stage 2 IBS std $=0.005$ vs $\Delta$ to SFT-MSE $\approx 0.12$, ratio $0.04\ll\tfrac{1}{3}$. \textbf{Pass.}
+\end{itemize}
+
+\section*{Spec Deviations (disclosed) \& Next Step}
+\textbf{Deviations.} Tuner: spec full FT, ours LoRA r=8 (retained as user choice; all other hparams aligned).
+Inference: spec 3-rollout CoT + hazard averaging; ours empty \texttt{<cot></cot>}. Ablation: gen3 mean IBS 0.013 vs empty 0.011 -- empty is the deterministic better choice.\\
+\textbf{Next (Stage 3 -- Liangyu).} SFT-CoT is at the edge: 2/3 seeds point-IBS $<$ B1 but tied at 95\% CI; output variance $\approx\tfrac{1}{3}$ of truth.
+GRPO per-rollout reward (\S3,\S4 of plan) is positioned to push the remaining variance back, closing the unconditional-IBS gap to B1.
+
+\end{document}

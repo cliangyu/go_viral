@@ -1,0 +1,48 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/inflection_analysis.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_strict/submission.parquet:SFT-MSE-42 /vol/runs/sft_mse/seed43_strict/submission.parquet:SFT-MSE-43 /vol/runs/sft_mse/seed44_strict/submission.parquet:SFT-MSE-44 /vol/runs/sft_hazard_cot/seed42_a0.1_strict/submission.parquet:SFT-CoT-42 /vol/runs/sft_hazard_cot/seed43_a0.1_strict/submission.parquet:SFT-CoT-43 /vol/runs/sft_hazard_cot/seed44_a0.1_strict/submission.parquet:SFT-CoT-44 --gt /vol/data/splits/test_minimal_eval.jsonl --out /vol/reports/protocol/inflection.png
+--- stdout ---
+common ads across all methods: 87
+
+=== mean IBS by novelty quartile ===
+method     | Q1 (closest to B1)     | Q2                     | Q3                     | Q4 (farthest from B1) 
+--------------------------------------------------------------------------------------------------------------
+B1         | 0.0012 (n=22)          | 0.0032 (n=22)          | 0.0072 (n=21)          | 0.0217 (n=22)         
+B0         | 0.1733 (n=22)          | 0.1975 (n=22)          | 0.1881 (n=21)          | 0.1512 (n=22)         
+B2         | 0.2074 (n=22)          | 0.2399 (n=22)          | 0.2200 (n=21)          | 0.1660 (n=22)         
+SFT-MSE-42 | 0.1534 (n=22)          | 0.1636 (n=22)          | 0.1870 (n=21)          | 0.1738 (n=22)         
+SFT-MSE-43 | 0.1513 (n=22)          | 0.1970 (n=22)          | 0.2086 (n=21)          | 0.1841 (n=22)         
+SFT-MSE-44 | 0.1295 (n=22)          | 0.1548 (n=22)          | 0.1737 (n=21)          | 0.1835 (n=22)         
+SFT-CoT-42 | 0.0030 (n=22)          | 0.0024 (n=22)          | 0.0042 (n=21)          | 0.0251 (n=22)         
+SFT-CoT-43 | 0.0046 (n=22)          | 0.0039 (n=22)          | 0.0100 (n=21)          | 0.0322 (n=22)         
+SFT-CoT-44 | 0.0076 (n=22)          | 0.0037 (n=22)          | 0.0059 (n=21)          | 0.0277 (n=22)         
+
+=== mean drop-localization error (seconds) by novelty quartile ===
+Lower = method puts the steepest-drop second closer to the truth.
+method     | Q1 (closest to B1)     | Q2                     | Q3                     | Q4 (farthest from B1) 
+--------------------------------------------------------------------------------------------------------------
+B1         | 0.00s (n=22)           | 0.05s (n=22)           | 0.00s (n=21)           | 0.09s (n=22)          
+B0         | 0.00s (n=22)           | 0.05s (n=22)           | 0.00s (n=21)           | 0.09s (n=22)          
+B2         | 3.41s (n=22)           | 2.09s (n=22)           | 2.10s (n=21)           | 1.95s (n=22)          
+SFT-MSE-42 | 11.64s (n=22)          | 12.55s (n=22)          | 11.29s (n=21)          | 8.05s (n=22)          
+SFT-MSE-43 | 12.82s (n=22)          | 11.41s (n=22)          | 11.67s (n=21)          | 8.55s (n=22)          
+SFT-MSE-44 | 23.68s (n=22)          | 23.77s (n=22)          | 14.10s (n=21)          | 17.55s (n=22)         
+SFT-CoT-42 | 0.73s (n=22)           | 1.05s (n=22)           | 0.52s (n=21)           | 0.64s (n=22)          
+SFT-CoT-43 | 0.00s (n=22)           | 0.05s (n=22)           | 0.00s (n=21)           | 0.09s (n=22)          
+SFT-CoT-44 | 0.00s (n=22)           | 0.05s (n=22)           | 0.00s (n=21)           | 0.09s (n=22)          
+
+=== drop-localization accuracy (% ads where |t_hat - t_true| ≤ 1s) ===
+  B1         87/87 = 100.0%
+  B0         87/87 = 100.0%
+  B2         58/87 = 66.7%
+  SFT-MSE-42 6/87 = 6.9%
+  SFT-MSE-43 2/87 = 2.3%
+  SFT-MSE-44 10/87 = 11.5%
+  SFT-CoT-42 60/87 = 69.0%
+  SFT-CoT-43 87/87 = 100.0%
+  SFT-CoT-44 87/87 = 100.0%
+
+wrote /vol/reports/protocol/inflection.png
+
+--- stderr ---
+
+--- returncode ---
+0

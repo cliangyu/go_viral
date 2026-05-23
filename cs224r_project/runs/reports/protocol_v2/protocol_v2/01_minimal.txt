@@ -1,0 +1,41 @@
+$ python /root/cs224r_project/third_party/ttcc-eval/scripts/minimal_eval.py --preds /vol/runs/B1_mean_train_curve/submission.parquet:B1 /vol/runs/B0_constant_05/submission.parquet:B0 /vol/runs/B2_uniform_decay/submission.parquet:B2 /vol/runs/sft_mse/seed42_v2/submission.parquet:SFT-MSE-v2-42 /vol/runs/sft_mse/seed43_v2/submission.parquet:SFT-MSE-v2-43 /vol/runs/sft_mse/seed44_v2/submission.parquet:SFT-MSE-v2-44 /vol/runs/sft_hazard_cot/seed42_a0.1_v2/submission.parquet:SFT-CoT-v2-42 /vol/runs/sft_hazard_cot/seed43_a0.1_v2/submission.parquet:SFT-CoT-v2-43 /vol/runs/sft_hazard_cot/seed44_a0.1_v2/submission.parquet:SFT-CoT-v2-44 --gt /vol/data/splits/test_minimal_eval.jsonl --ref B1 --with-windows
+--- stdout ---
+
+method         |  n_par |     IBS |   BS(3) |  rho_H |  BS_end |  rho_C
+--------------------------------------------------------------------------------
+B1             |  87/ 87 | 0.0083  | 0.0200  |    n/a | 0.0027  | -0.029
+B0             |  87/ 87 | 0.1774  | 0.1318  |    n/a | 0.2202  |    n/a
+B2             |  87/ 87 | 0.2082  | 0.4886  | +0.436 | 0.0021  |    n/a
+SFT-MSE-v2-42  |  87/ 87 | 0.1290  | 0.0687  | +0.039 | 0.1668  | +0.081
+SFT-MSE-v2-43  |  87/ 87 | 0.1189  | 0.2055  | -0.158 | 0.1716  | +0.080
+SFT-MSE-v2-44  |  87/ 87 | 0.1357  | 0.1172  | +0.002 | 0.1602  | +0.019
+SFT-CoT-v2-42  |  87/ 87 | 0.0183  | 0.0578  | +0.311 | 0.0046  | +0.066
+SFT-CoT-v2-43  |  87/ 87 | 0.0076  | 0.0208  | +0.184 | 0.0014  | -0.005
+SFT-CoT-v2-44  |  87/ 87 | 0.0078  | 0.0219  | +0.297 | 0.0015  | -0.016
+
+method         |  IBS_[0,3] |  IBS_[T-2,T]    (time-restricted)
+------------------------------------------------------------
+B1             |    0.0220  |      0.0029
+B0             |    0.0732  |      0.2188
+B2             |    0.3366  |      0.0053
+SFT-MSE-v2-42  |    0.0658  |      0.1495
+SFT-MSE-v2-43  |    0.1078  |      0.1498
+SFT-MSE-v2-44  |    0.0763  |      0.1675
+SFT-CoT-v2-42  |    0.0436  |      0.0056
+SFT-CoT-v2-43  |    0.0222  |      0.0016
+SFT-CoT-v2-44  |    0.0239  |      0.0016
+
+Paired BCa ΔIBS vs B1 (n=87, B=10000):
+  B0             ΔIBS=+0.16909  CI95=[+0.15841, +0.17762]  ✓
+  B2             ΔIBS=+0.19987  CI95=[+0.18534, +0.21236]  ✓
+  SFT-MSE-v2-42  ΔIBS=+0.12063  CI95=[+0.09231, +0.14873]  ✓
+  SFT-MSE-v2-43  ΔIBS=+0.11052  CI95=[+0.08483, +0.13767]  ✓
+  SFT-MSE-v2-44  ΔIBS=+0.12733  CI95=[+0.09905, +0.15563]  ✓
+  SFT-CoT-v2-42  ΔIBS=+0.00993  CI95=[+0.00681, +0.01335]  ✓
+  SFT-CoT-v2-43  ΔIBS=-0.00072  CI95=[-0.00203, +0.00074]  ~ tied
+  SFT-CoT-v2-44  ΔIBS=-0.00056  CI95=[-0.00224, +0.00135]  ~ tied
+
+--- stderr ---
+
+--- returncode ---
+0
