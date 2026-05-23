@@ -61,7 +61,7 @@ class LazyLLMDataset(Dataset):
                  dataset: HfDataset,
                  encode_func: Callable[[Dict[str, Any]], Dict[str, Any]],
                  *,
-                 n_try_fetch: int = 10,
+                 n_try_fetch: int = 30,
                  strict: bool = False,
                  random_state: Optional[Union[np.random.RandomState, int]] = None,
                  traceback_limit: int = 10) -> None:
