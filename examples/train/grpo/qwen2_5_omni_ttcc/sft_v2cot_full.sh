@@ -48,22 +48,32 @@ else
     echo "[$(date '+%F %T')] val_dataset = (none — overfit test, no val loss tracking)" | tee -a "${OUT}/sft.log"
 fi
 
+OMP_NUM_THREADS=6 \
 MAX_PIXELS=200704 \
 VIDEO_MAX_PIXELS=200704 \
 FPS_MAX_FRAMES=60 \
-VIDEO_MAX_TOKEN_NUM=8192 \
-NPROC_PER_NODE=2 \
-CUDA_VISIBLE_DEVICES=0,1 \
+VIDEO_MAX_TOKEN_NUM=16384 \
+NPROC_PER_NODE=8 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 "${VENV}/bin/python" -m swift.cli.main sft \
     --model /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B \
     --tuner_type full \
+    --attn_impl flash_attn \
     --freeze_vit true \
     --freeze_aligner true \
     --torch_dtype bfloat16 \
     --dataset "${SFT_DATA}" \
     "${VAL_ARGS[@]}" \
-    --max_length 8192 \
+    --max_length 24576 \
     --truncation_strategy delete \
+    --lazy_tokenize true \
+    --strict false \
+    --dataset_num_proc 1 \
+    --group_by_length false \
+    --vit_gradient_checkpointing true \
+    --torch_compile true \
+    --dataloader_persistent_workers true \
+    --dataloader_prefetch_factor 4 \
     --num_train_epochs "${EPOCHS}" \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
@@ -75,7 +85,8 @@ CUDA_VISIBLE_DEVICES=0,1 \
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit "${SAVE_LIMIT}" \
     --output_dir "${OUT}" \
-    --deepspeed zero2 \
-    --dataloader_num_workers 2 \
+    --resume_from_checkpoint /opt/dlami/nvme/ssm-out/ttcc_sft_v2cot_nocot_full/v19-20260523-181720/checkpoint-200 \
+    --deepspeed zero3 \
+    --dataloader_num_workers 4 \
     --report_to tensorboard wandb \
     2>&1 | tee -a "${OUT}/sft.log"

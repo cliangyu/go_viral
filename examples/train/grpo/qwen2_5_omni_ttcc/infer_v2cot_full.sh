@@ -23,7 +23,7 @@ TMP_JSONL="$(mktemp /tmp/ttcc_infer_XXXX.jsonl)"
 # Disable Talker (speech generation) — saves ~1.5 GB GPU memory per device.
 export ENABLE_AUDIO_OUTPUT="False"
 
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 FPS_MAX_FRAMES=60 FPS=1.0 \
 MAX_PIXELS=200704 VIDEO_MAX_PIXELS=200704 \
 VIDEO_MAX_TOKEN_NUM=8192 \
