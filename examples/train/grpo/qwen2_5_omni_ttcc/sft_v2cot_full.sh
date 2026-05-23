@@ -8,15 +8,20 @@
 #   lazy_tokenize=true            varlen per row; no padding to max_length
 #   group_by_length=false         incompatible with lazy_tokenize (missing 'lengths' column)
 #   attn_impl=flash_attn          FA2.8.3 compiled for sm_120 Blackwell (FA3/4 unsupported)
-#   torch_compile=true            inductor fuses logits.float() cast with CE loss → -32 GiB peak
-#   per_device_batch=2, accum=4   effective batch 16; T4b verified +bs2 fits at 87 GiB peak
+#   torch_compile=true            inductor fuses logits.float() with CE loss when compiled;
+#                                 BUT recompiles per shape and falls back to eager on rare
+#                                 long-long batches. Use bs=1 to bound worst-case logits.
+#   per_device_batch=1, accum=8   effective batch 16. Was bs=2/ga=4 in T1-T6 sweep, but H2
+#                                 production OOMed on a long-long batch at step 6 because
+#                                 inductor didn't fuse the rare shape. Bs=1 caps logits at
+#                                 ~12 GiB even in eager fallback — OOM-safe at ~56 GiB peak.
 #   dataloader_num_workers=4      T6a sweep: U-curve inflection (w<4 underfeeds, w>4 oversubscribes)
 #   persistent_workers=true       amortize spawn cost across epochs
 #   prefetch_factor=4             absorb tail-latency from long-video decodes
 #   deepspeed=zero3 (no offload)  T1c verified plain zero2 trades +5 GiB for ~2% — not worth
 #   use_liger_kernel=false        T1b: Qwen2.5-Omni bypasses transformers' ForCausalLMLoss path
 #   ENABLE_AUDIO_OUTPUT=False     disables Talker (~833 M params, ~1.5 GiB GPU)
-# Net result: ~63 s/step steady-state (vs 227 s/step baseline = 3.3x speedup).
+# Net result: ~60 s/step steady-state (vs 227 s/step baseline = ~3.8x speedup, safety-first).
 #
 # Env vars (all optional):
 #   SFT_DATA       train JSONL  (default: ttcc_swift_v2cot/ttcc_train_sft.jsonl)
@@ -86,8 +91,8 @@ CUDA_VISIBLE_DEVICES=0,1 \
     --dataset_num_proc 1 \
     --group_by_length false \
     --num_train_epochs "${EPOCHS}" \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
     --gradient_checkpointing true \
     --vit_gradient_checkpointing true \
     --torch_compile true \
