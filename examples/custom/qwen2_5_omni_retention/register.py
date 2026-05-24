@@ -561,11 +561,31 @@ def _masked_mse(r_pred: torch.Tensor, r_true: torch.Tensor,
 
 
 class RetentionLoss(BaseLoss):
-    """Loss for retention-curve heads.
+    """Loss for retention-curve heads — plain masked MSE on R(t) for both
+    hazard and sigmoid variants.
 
     Reads r_pred from the model output (stashed by the patched forward) and
     r_true / r_mask similarly. If labels are present (with-CoT variants),
     optionally adds an LM cross-entropy term gated by RETENTION_COT_ALPHA.
+
+    Why plain MSE on R(t) and not log-hazard MSE:
+      The eval metric is IBS = mean MSE on R. The hazard architecture
+      (softplus -> cumsum -> exp) enforces monotonicity structurally, so the
+      loss is free to be anything; matching the eval metric is the natural
+      choice. Log-hazard MSE (wanjia milestone Sec.3) suffers a ~120x
+      per-position loss inflation on flat-tail positions where
+      lam_true ~= 0 gets clamped to eps -> log(eps) ~= -13.8; this noise
+      then dominates the gradient and clipping rules training (observed
+      grad_norm 25K vs 2K when we switched). Switching to plain MSE
+      reduced reported loss ~60x and grad_norm ~10x on V7 production vs
+      V6 (both 8-GPU full-FT, same data). See HEAD_COMPARISON.md and the
+      loss-choice fragment in docs/ for the full Feynman walkthrough.
+
+    Known residual risk: the gradient ∂L/∂z(s) carries a factor R_pred(t),
+    which is small for tail positions, so tail-region z values learn more
+    slowly than mid-curve ones. Bounded contribution to IBS (~15% of
+    wanjia's best result IBS=0.0076 in the worst case). Mitigation if
+    observed in eval: weighted MSE upweighting tail residuals.
     """
 
     def __call__(self, outputs, labels, *, num_items_in_batch=None,

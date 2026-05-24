@@ -60,3 +60,8 @@ bash sft.sh configs/sft_lm_full_no_cot.yaml --learning_rate 5e-6 --num_train_epo
 4. **Variant names are semantic** — read top-to-bottom, you know what it
    is. Anti-patterns to avoid: `v2cot`, `extended`, `nocot_v2cot_full`,
    numeric versions in filenames.
+
+
+## Loss
+
+All retention variants (hazard, sigmoid) train with plain masked MSE on R(t). See `examples/custom/qwen2_5_omni_retention/README.md` for the rationale.

@@ -40,6 +40,46 @@ The `--external_plugins` flag imports `register.py`; the registrations
 fire as import side-effects and `qwen2_5_omni_retention` becomes a valid
 `--model_type` value.
 
+
+## Loss function
+
+Both heads (hazard, sigmoid) train with **plain masked MSE on R(t)**:
+
+```
+L = mean over (t, ad) of (R_pred(t) - R_true(t))² * duration_mask
+```
+
+This matches the eval metric (IBS) exactly. The monotonicity prior (for
+hazard) lives in the architecture (`softplus → cumsum → exp`), not the
+loss — switching the loss does not weaken the prior.
+
+We considered the survival-analysis canonical choice, **log-hazard MSE**
+(wanjia milestone §3):
+
+```
+L_LH = mean over (t, ad) of (log λ_pred(t) - log λ_true(t))² * mask
+```
+
+but rejected it because:
+
+1. **Flat-tail explosion**: retention curves are typically flat in their
+   last ~30s (loyal viewers stay). At those positions `λ_true ≈ 0`,
+   clamped to `ε = 1e-6`, giving `log(ε) ≈ -13.8`. A reasonable model
+   prediction `log(λ_pred) ≈ -3` produces `(-3 - (-13.8))² ≈ 117` per
+   position. This noise dominates the loss and inflates `grad_norm`
+   by ~10× (observed 25K vs 2.4K under plain MSE in V6 vs V7 8-GPU
+   prod runs).
+2. **Not the survival-lit standard anyway**: DeepHit, MTLR, Nnet-survival,
+   PC-Hazard, SurvTRACE all use Bernoulli/PMF NLL on hazards, not
+   log-hazard MSE. The "spec" loss was idiosyncratic.
+3. **Train-on-eval-metric is correct** when the metric is strictly proper
+   (Brier 1950) and there's no censoring (our case). Sonabend et al.
+   ECML-PKDD 2024 confirmed empirically that matching loss to metric is
+   competitive-to-better than survival-style proxies.
+
+`RETENTION_COT_ALPHA > 0` adds an LM cross-entropy term on the assistant
+turn for with-CoT variants. Default 0 (no auxiliary loss).
+
 ## Configuration
 
 | Env var / flag | Default | Meaning |
