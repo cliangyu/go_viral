@@ -33,7 +33,7 @@ ENV:
 
 # CoT-distilled dataset; rows carry an R field (list of T_i+1 floats).
 dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.jsonl
-max_length: 24576
+max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
@@ -66,6 +66,7 @@ deepspeed: zero2
 num_train_epochs: 10
 learning_rate: 1.0e-4                         # LoRA tolerates higher LR
 warmup_ratio: 0.05
+max_grad_norm: 1.0
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
 

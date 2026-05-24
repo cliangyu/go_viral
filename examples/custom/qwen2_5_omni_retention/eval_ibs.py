@@ -84,6 +84,8 @@ def main():
     ap.add_argument('--plugin', required=True)
     ap.add_argument('--head-type', default='hazard', choices=['hazard', 'sigmoid'])
     ap.add_argument('--max-length', type=int, default=24576)
+    ap.add_argument('--output', type=Path, default=None,
+                    help='Optional: write per-ad results + summary as JSON (parent dirs auto-created).')
     args = ap.parse_args()
 
     # 1. Import plugin to register model_type / template / loss.
@@ -120,6 +122,7 @@ def main():
     # 4. Per-ad IBS for both the model and B_1.
     model_ibs = []
     b1_ibs = []
+    ad_records = []
     skipped = 0
     for i, row in enumerate(val_rows):
         R_true = np.array(row.get('R') or row.get('R_true'), dtype=np.float32)
@@ -180,6 +183,8 @@ def main():
         ibs_b1 = per_ad_ibs(B1_curve[: T_i + 1], R_true, T_i)
         model_ibs.append(ibs_model)
         b1_ibs.append(ibs_b1)
+        ad_records.append({'idx': i, 'ad_id': row.get('ad_id'), 'T': T_i,
+                           'ibs_model': ibs_model, 'ibs_b1': ibs_b1})
         print(f'[eval] ad {i:3d} (T={T_i:2d}): IBS_model={ibs_model:.5f}  IBS_B1={ibs_b1:.5f}  Δ={ibs_model - ibs_b1:+.5f}')
 
     print()
@@ -188,6 +193,23 @@ def main():
     print(f'[summary] mean IBS (B_1)   = {np.mean(b1_ibs):.5f}')
     print(f'[summary] Δ = {np.mean(model_ibs) - np.mean(b1_ibs):+.5f}  '
           f"({'model wins' if np.mean(model_ibs) < np.mean(b1_ibs) else 'B_1 wins'})")
+
+    if args.output is not None:
+        import json
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        summary = {
+            'n_evaluated': len(model_ibs),
+            'n_skipped': skipped,
+            'mean_ibs_model': float(np.mean(model_ibs)) if model_ibs else None,
+            'mean_ibs_b1': float(np.mean(b1_ibs)) if b1_ibs else None,
+            'delta_mean_ibs': float(np.mean(model_ibs) - np.mean(b1_ibs)) if model_ibs else None,
+            'checkpoint': args.checkpoint,
+            'val_jsonl': args.val_jsonl,
+            'head_type': args.head_type,
+            'limit': args.limit,
+        }
+        args.output.write_text(json.dumps({'summary': summary, 'per_ad': ad_records}, indent=2))
+        print(f'[eval] wrote {args.output}')
 
 
 if __name__ == '__main__':

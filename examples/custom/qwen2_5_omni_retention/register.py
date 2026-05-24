@@ -109,6 +109,13 @@ class RetentionHead(nn.Module):
         self.t_max = t_max
         # fp32 head: bf16 rounding error compounds over the cumsum.
         self.linear = nn.Linear(hidden_size, t_max, dtype=torch.float32)
+        # Init the bias so the head starts in a sensible regime, not vanished.
+        # For hazard: softplus(-3) ~= 0.05  ->  cumsum at T=60 ~= 3  ->  R(60) ~= 0.05
+        # instead of the default exp(-42) ~= 0 that triggers the eps clamp and
+        # makes the log-hazard MSE / grad_norm explode at step 0. This is the
+        # standard trick for monotone hazard heads at init.
+        if head_type == 'hazard':
+            nn.init.constant_(self.linear.bias, -3.0)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         # h : (B, hidden_size)

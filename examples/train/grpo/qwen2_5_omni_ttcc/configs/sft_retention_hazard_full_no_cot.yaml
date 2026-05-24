@@ -25,7 +25,7 @@ ENV:
 dataset: /home/ssm-user/work/data/ttcc_swift_v2cot_nocot/ttcc_train_sft.jsonl
 val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
 eval_strategy: steps
-max_length: 24576
+max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
@@ -45,6 +45,7 @@ deepspeed: zero3
 num_train_epochs: 10
 learning_rate: 5.0e-6
 warmup_ratio: 0.05
+max_grad_norm: 1.0
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
 

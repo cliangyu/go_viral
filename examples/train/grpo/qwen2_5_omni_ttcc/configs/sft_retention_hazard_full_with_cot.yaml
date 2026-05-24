@@ -27,7 +27,7 @@ ENV:
 
 # CoT-distilled dataset; rows carry R or R_true (plugin accepts either).
 dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.under60s.jsonl
-max_length: 24576
+max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
@@ -52,6 +52,7 @@ deepspeed: zero3
 num_train_epochs: 10
 learning_rate: 5.0e-6                         # full-FT range (matches H2)
 warmup_ratio: 0.05
+max_grad_norm: 1.0
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
 
