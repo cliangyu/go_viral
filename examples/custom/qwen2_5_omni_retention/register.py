@@ -595,11 +595,13 @@ class RetentionLoss(BaseLoss):
                 f'Qwen2_5OmniRetentionTemplate must be active. Output keys: {keys[:20]}; '
                 f'r_pred={r_pred is not None}, r_true={r_true is not None}, r_mask={r_mask is not None}.')
 
+        # Both heads use plain MSE on R(t). This matches the IBS eval metric
+        # exactly. The monotonicity prior (for hazard) lives in the architecture
+        # (softplus → cumsum → exp), not the loss; using MSE here doesn't
+        # weaken the prior. Avoids log-hazard MSE's ~1000x loss inflation on
+        # flat-tail positions where lam_true clamps to eps. See docs/loss-choice.md.
         head_type = get_env_args('RETENTION_HEAD_TYPE', str, 'hazard')
-        if head_type == 'hazard':
-            loss_curve = _log_hazard_mse(r_pred, r_true, r_mask)
-        else:
-            loss_curve = _masked_mse(r_pred, r_true, r_mask)
+        loss_curve = _masked_mse(r_pred, r_true, r_mask)
 
         alpha = float(get_env_args('RETENTION_COT_ALPHA', str, '0.0'))
         if alpha > 0 and labels is not None and getattr(outputs, 'logits', None) is not None:
