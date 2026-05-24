@@ -100,15 +100,37 @@ def main():
     print(f'[eval] B_1 curve length: {len(B1_curve)} (T_max={T_max})')
 
     # 3. Load model + tokenizer via ms-swift.
+    # LoRA checkpoint dir holds adapter_model.safetensors + adapter_config.json
+    # but no preprocessor / tokenizer / image_processor — those live with the
+    # base model. Detect LoRA via adapter_config.json, load base + processor
+    # from base_model_name_or_path, then apply the adapter on top.
     from swift.model import get_model_processor
     from swift.template import get_template
 
-    model, processor = get_model_processor(
-        args.checkpoint,
-        torch_dtype=torch.bfloat16,
-        model_kwargs={'device_map': 'cuda'},
-        model_type='qwen2_5_omni_retention',
-    )
+    adapter_config_path = os.path.join(args.checkpoint, 'adapter_config.json')
+    if os.path.exists(adapter_config_path):
+        with open(adapter_config_path) as f:
+            adapter_cfg = json.load(f)
+        base_path = adapter_cfg['base_model_name_or_path']
+        print(f'[eval] LoRA adapter detected; base = {base_path}')
+        model, processor = get_model_processor(
+            base_path,
+            torch_dtype=torch.bfloat16,
+            model_kwargs={'device_map': 'cuda'},
+            model_type='qwen2_5_omni_retention',
+        )
+        # Apply adapter on top (peft loads modules_to_save head too).
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, args.checkpoint, is_trainable=False)
+        print(f'[eval] adapter loaded from {args.checkpoint}')
+    else:
+        # Full-FT checkpoint: directory contains model.safetensors* + processor files.
+        model, processor = get_model_processor(
+            args.checkpoint,
+            torch_dtype=torch.bfloat16,
+            model_kwargs={'device_map': 'cuda'},
+            model_type='qwen2_5_omni_retention',
+        )
     model.eval()
     # get_template signature: (processor, default_system=None, max_length=None, *, template_type=None, ...)
     # template_type is keyword-only; pass it explicitly because the registered name and the model_type collide.
