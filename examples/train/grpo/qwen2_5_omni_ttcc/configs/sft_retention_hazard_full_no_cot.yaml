@@ -23,6 +23,8 @@ ENV:
   RETENTION_COT_ALPHA: '0.0'                # no CoT body → no auxiliary loss
 
 dataset: /home/ssm-user/work/data/ttcc_swift_v2cot_nocot/ttcc_train_sft.jsonl
+val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
+eval_strategy: steps
 max_length: 24576
 truncation_strategy: delete
 lazy_tokenize: true
@@ -49,9 +51,8 @@ gradient_accumulation_steps: 8
 logging_steps: 1
 eval_steps: 50
 save_steps: 50
-save_total_limit: 3
-report_to: [tensorboard]
-
+save_total_limit: 10
+report_to: [tensorboard, wandb]
 output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_no_cot
 
 dataloader_num_workers: 4
