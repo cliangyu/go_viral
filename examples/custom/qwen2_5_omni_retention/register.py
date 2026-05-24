@@ -112,7 +112,12 @@ class RetentionHead(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         # h : (B, hidden_size)
-        z = self.linear(h.float())
+        # DeepSpeed's bf16 mode casts our Linear's weights to bf16 even though
+        # we constructed it as fp32 (Linear(..., dtype=torch.float32)). Match
+        # the actual weight dtype for the matmul, then upcast to fp32 *after*
+        # so the downstream cumsum + exp stays numerically stable.
+        w_dtype = self.linear.weight.dtype
+        z = self.linear(h.to(w_dtype)).float()
         if self.head_type == 'hazard':
             lam = F.softplus(z)                                       # (B, T) >= 0
             return torch.exp(-torch.cumsum(lam, dim=-1))              # (B, T) in (0, 1]
@@ -130,34 +135,79 @@ class _RetentionWrapperState:
     """
 
 
+class _HiddenStateHolder:
+    """Per-instance side-channel state used by the retention wrapper.
+
+    - ``last``: final-layer hidden state captured by a forward_pre_hook on
+      ``model.thinker.lm_head``. Bypasses ``output_hidden_states``, which
+      has issues with transformers >=4.5 ``@capture_outputs`` + gradient
+      checkpointing.
+    - ``input_ids``: raw token ids captured by a forward_pre_hook on
+      ``model``. ms-swift's post_encode_hook converts ``input_ids`` to
+      ``inputs_embeds`` before the wrapped forward runs, so the wrapper
+      can no longer find the anchor token from ``kwargs['input_ids']``.
+      Our pre_hook is registered at model-load time (before swift's),
+      so PyTorch fires it first and we get the pre-conversion value.
+    """
+    __slots__ = ('last', 'input_ids', 'r_true', 'r_mask', 'r_pred')
+
+    def __init__(self):
+        self.last = None
+        self.input_ids = None
+        self.r_true = None
+        self.r_mask = None
+        self.r_pred = None
+
+
+def _make_lm_head_capture_hook(holder: '_HiddenStateHolder'):
+    """forward_pre_hook on lm_head: input[0] is (B, L, d) — the final hidden state."""
+    def _hook(module, args, kwargs):
+        h = args[0] if args else kwargs.get('input')
+        holder.last = h
+    return _hook
+
+
 def _make_retention_forward(original_forward, head: RetentionHead,
-                            anchor_ids: list[int]):
+                            anchor_ids: list[int], holder: '_HiddenStateHolder'):
     """Patch the base model's forward so it also computes r_pred."""
 
     def forward(self, *args, r_true=None, r_mask=None, **kwargs):
-        # Force hidden states on so we can read the anchor position.
-        kwargs.setdefault('output_hidden_states', True)
+        # The lm_head forward_pre_hook captures the final hidden state into
+        # holder.last during this call. No need to ask for output_hidden_states.
+        holder.last = None
         out = original_forward(*args, **kwargs)
-        # Outputs from Qwen2.5-Omni: last_hidden_state OR hidden_states[-1].
-        h_last = None
-        if hasattr(out, 'hidden_states') and out.hidden_states is not None:
-            h_last = out.hidden_states[-1]
-        elif hasattr(out, 'last_hidden_state'):
-            h_last = out.last_hidden_state
+        h_last = holder.last
         if h_last is None:
             raise RuntimeError(
-                'RetentionWrapper: model forward did not return hidden states; '
-                'output_hidden_states=True must be honored by the backbone.')
-        input_ids = kwargs.get('input_ids')
+                'RetentionWrapper: lm_head forward_pre_hook did not fire; '
+                'check that thinker.lm_head is the right capture point.')
+        # input_ids / r_true / r_mask were stashed by our template's
+        # _post_encode before swift's pre_forward_hook stripped them.
+        input_ids = holder.input_ids if holder.input_ids is not None else kwargs.get('input_ids')
         if input_ids is None and len(args) > 0:
             input_ids = args[0]
+        if r_true is None:
+            r_true = holder.r_true
+        if r_mask is None:
+            r_mask = holder.r_mask
         anchor_idx = _locate_anchor_positions(input_ids, anchor_ids)
         h_anchor = h_last[torch.arange(h_last.size(0), device=h_last.device),
                           anchor_idx]                                  # (B, d)
         r_pred = head(h_anchor)                                        # (B, T)
+        # Set on out for the loss to read. Some downstream transforms (e.g.
+        # DeepSpeed/DDP wrappers) may drop arbitrary attrs, so we also stash
+        # on the holder as a fallback. RetentionLoss reads via getattr first
+        # and falls back to holder.r_pred if missing.
         out.r_pred = r_pred
         out.r_true = r_true
         out.r_mask = r_mask
+        holder.r_pred = r_pred
+        # r_true / r_mask are already in holder from _post_encode; refresh
+        # only if the caller passed explicit overrides.
+        if r_true is not None:
+            holder.r_true = r_true
+        if r_mask is not None:
+            holder.r_mask = r_mask
         return out
 
     return forward
@@ -217,9 +267,28 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         anchor_ids = _find_close_cot_token_ids(tokenizer)
 
+        # Install lm_head forward_pre_hook to capture the final hidden state
+        # into a per-instance holder. This sidesteps output_hidden_states which
+        # has issues with @capture_outputs + gradient checkpointing in
+        # transformers >=4.5.
+        #
+        # The holder is also used by Qwen2_5OmniRetentionTemplate._post_encode
+        # to stash input_ids / r_true / r_mask before swift's pre_forward_hook
+        # strips them from kwargs. Lookup path: model._retention_h_holder.
+        holder = _HiddenStateHolder()
+        model._retention_h_holder = holder
+        model.thinker.lm_head.register_forward_pre_hook(
+            _make_lm_head_capture_hook(holder), with_kwargs=True)
+
         # Patch forward to also compute r_pred and pass-through r_true / r_mask.
-        original_forward = type(model).forward
-        new_forward = _make_retention_forward(original_forward, head, anchor_ids)
+        # Capture the *bound* instance method that use_submodel_func attached on
+        # line 197 above. type(model).forward would resolve to
+        # nn.Module._forward_unimplemented here because
+        # Qwen2_5OmniForConditionalGeneration has no class-level forward — the
+        # working forward lives on the instance as a routed delegate to
+        # model.thinker.forward.
+        original_forward = model.forward
+        new_forward = _make_retention_forward(original_forward, head, anchor_ids, holder)
         # Bind as instance method so we don't affect other instances.
         import types
         model.forward = types.MethodType(new_forward, model)
@@ -305,14 +374,68 @@ class Qwen2_5OmniRetentionTemplate(Qwen2_5OmniTemplate):
 
     def _data_collator(self, batch, *, padding_to=None):
         # Super handles position_ids, packed_seq_params, padding_free,
-        # multimodal mm_data, etc. We just stack our per-sample tensors
-        # on top — they pass through to model.forward as kwargs and get
-        # captured by the retention patch.
+        # multimodal mm_data, etc. We stack our per-sample tensors on top —
+        # they pass through to model.forward as kwargs and get captured by
+        # the retention patch.
+        #
+        # _encode adds r_true / r_mask to each sample dict, but swift's
+        # encoding pipeline collapses keys to a stable schema before
+        # collation, so r_true may be missing from batch[i]. The 'R' field
+        # from the raw dataset row survives (remove_unused_columns=False),
+        # so derive r_true / r_mask from R here as a fallback.
         res = super()._data_collator(batch, padding_to=padding_to)
+        # Source for R per sample, in priority order:
+        #   1. batch[i]['r_true']  — populated by _encode (usually stripped)
+        #   2. batch[i]['R']       — raw column when remove_unused_columns=False
+        #   3. batch[i]['_extra_kwargs']['R']  — swift stashes original row
+        #      extras here when remove_unused_columns=False; this is the
+        #      reliable path on multimodal templates because _encode's
+        #      non-canonical keys get filtered.
         if batch and 'r_true' in batch[0]:
             res['r_true'] = torch.stack([b['r_true'] for b in batch])
             res['r_mask'] = torch.stack([b['r_mask'] for b in batch])
+        else:
+            R_list = []
+            for b in batch:
+                R = b.get('R')
+                if R is None:
+                    ek = b.get('_extra_kwargs') or {}
+                    R = ek.get('R') if isinstance(ek, dict) else None
+                R_list.append(R)
+            if any(R is not None for R in R_list):
+                r_trues, r_masks = [], []
+                for R in R_list:
+                    rt = torch.full((T_MAX,), float('nan'))
+                    rm = torch.zeros(T_MAX, dtype=torch.bool)
+                    if R is not None:
+                        T_i = max(0, len(R) - 1)
+                        if T_i > 0:
+                            rt[:T_i] = torch.tensor(R[1:T_i + 1], dtype=torch.float32)
+                            rm[:T_i] = True
+                    r_trues.append(rt)
+                    r_masks.append(rm)
+                res['r_true'] = torch.stack(r_trues)
+                res['r_mask'] = torch.stack(r_masks)
         return res
+
+    def _post_encode(self, model, inputs):
+        # ms-swift's pre_forward_hook calls _post_encode, then keeps only a
+        # canonical set of kwargs (input_ids/attention_mask/labels/position_ids/
+        # output_hidden_states/logits_to_keep/...). r_true, r_mask and the
+        # original input_ids would be dropped before our wrapped forward runs.
+        # Stash them into the model's per-instance holder so the wrapper can
+        # read them back. Then proceed with the parent's MM encoding.
+        holder = getattr(model, '_retention_h_holder', None)
+        if holder is None:
+            base = getattr(model, 'base_model', None)
+            if base is not None:
+                holder = getattr(getattr(base, 'model', base), '_retention_h_holder', None)
+        if holder is not None:
+            holder.input_ids = inputs.get('input_ids')
+            if 'r_true' in inputs:
+                holder.r_true = inputs['r_true']
+                holder.r_mask = inputs['r_mask']
+        return super()._post_encode(model, inputs)
 
 
 # Reuse the stock Qwen template meta (chat-template strings, stop words,
@@ -369,15 +492,31 @@ class RetentionLoss(BaseLoss):
     """
 
     def __call__(self, outputs, labels, *, num_items_in_batch=None,
-                 loss_scale=None, **kwargs) -> torch.Tensor:
+                 loss_scale=None, trainer=None, **kwargs) -> torch.Tensor:
         r_pred = getattr(outputs, 'r_pred', None)
         r_true = getattr(outputs, 'r_true', None)
         r_mask = getattr(outputs, 'r_mask', None)
+        # Fallback: read from the model's _retention_h_holder when the
+        # outputs object lost the attrs (e.g. DDP/DeepSpeed wrappers).
+        if (r_pred is None or r_true is None or r_mask is None) and trainer is not None:
+            unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+            base = getattr(unwrapped, 'base_model', unwrapped)
+            base = getattr(base, 'model', base)
+            holder = getattr(base, '_retention_h_holder', None)
+            if holder is not None:
+                if r_pred is None:
+                    r_pred = holder.r_pred
+                if r_true is None:
+                    r_true = holder.r_true
+                if r_mask is None:
+                    r_mask = holder.r_mask
         if r_pred is None or r_true is None or r_mask is None:
+            keys = list(outputs.keys()) if hasattr(outputs, 'keys') else dir(outputs)
             raise RuntimeError(
                 'RetentionLoss requires r_pred/r_true/r_mask on the model '
-                'output. The retention plugin must be loaded and the '
-                'Qwen2_5OmniRetentionTemplate must be active.')
+                'output (or holder). The retention plugin must be loaded and '
+                f'Qwen2_5OmniRetentionTemplate must be active. Output keys: {keys[:20]}; '
+                f'r_pred={r_pred is not None}, r_true={r_true is not None}, r_mask={r_mask is not None}.')
 
         head_type = get_env_args('RETENTION_HEAD_TYPE', str, 'hazard')
         if head_type == 'hazard':

@@ -6,7 +6,7 @@
 #
 # What this does:
 #   1. Sources _common.sh for env (paths, ENABLE_AUDIO_OUTPUT, FPS, etc.).
-#   2. Extracts extra_env from the YAML (variant-specific env vars like
+#   2. Extracts ENV from the YAML (variant-specific env vars like
 #      RETENTION_HEAD_TYPE) and exports them.
 #   3. Picks single-GPU plain python vs torchrun multi-GPU based on
 #      NPROC_PER_NODE (single-card boxes don't need torchrun overhead).
@@ -26,13 +26,13 @@ if [[ ! -f "${CONFIG}" ]]; then
     exit 1
 fi
 
-# Pull variant-specific env vars (extra_env: in the YAML) and export them.
+# Pull variant-specific env vars (ENV: in the YAML) and export them.
 # Requires yq (https://github.com/mikefarah/yq); we install it in the
 # Dockerfile and the venv bin.
-if command -v yq >/dev/null 2>&1 && yq e '.extra_env // {} | keys' "${CONFIG}" >/dev/null 2>&1; then
+if command -v yq >/dev/null 2>&1 && yq e '.ENV // {} | keys' "${CONFIG}" >/dev/null 2>&1; then
     while IFS='=' read -r k v; do
         [[ -n "${k}" ]] && export "${k}=${v}"
-    done < <(yq e '.extra_env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "${CONFIG}")
+    done < <(yq e '.ENV // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "${CONFIG}")
 fi
 
 # Multi-machine env vars (default to single-node single-process).

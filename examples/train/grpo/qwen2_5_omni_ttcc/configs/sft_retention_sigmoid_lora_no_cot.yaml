@@ -16,12 +16,18 @@ external_plugins:
 model_type: qwen2_5_omni_retention
 loss_type: retention_loss
 
-extra_env:
+# Key name "ENV" is mandatory: ms-swift's parse_yaml_args pops it from the
+# YAML and writes os.environ before SwiftSft initializes. Any other key
+# name (e.g. extra_env) becomes a remaining_argv error.
+ENV:
   RETENTION_HEAD_TYPE: sigmoid
   RETENTION_COT_ALPHA: '0.0'                  # no CoT → no auxiliary LM loss
 
 # No-CoT dataset (curve numbers only in assistant turn, no <cot> reasoning).
 dataset: /home/ssm-user/work/data/ttcc_swift_v2cot_nocot/ttcc_train_sft.jsonl
+# Required: the retention plugin reads R via _extra_kwargs; removing
+# unused columns strips it before collation.
+remove_unused_columns: false
 max_length: 24576
 truncation_strategy: delete
 lazy_tokenize: true
@@ -33,6 +39,10 @@ tuner_type: lora
 lora_rank: 16
 lora_alpha: 32
 target_modules: all-linear
+# Persist the retention_head in adapter_model.safetensors. Without this,
+# peft freezes non-LoRA params and the head's random-init weights are lost.
+modules_to_save:
+  - retention_head
 freeze_vit: true
 freeze_aligner: true
 

@@ -12,10 +12,10 @@ source "${HERE}/_common.sh"
 CONFIG="${1:?path to configs/<variant>.yaml required}"; shift || true
 [[ -f "${CONFIG}" ]] || { echo "config not found: ${CONFIG}" >&2; exit 1; }
 
-if command -v yq >/dev/null 2>&1 && yq e '.extra_env // {} | keys' "${CONFIG}" >/dev/null 2>&1; then
+if command -v yq >/dev/null 2>&1 && yq e '.ENV // {} | keys' "${CONFIG}" >/dev/null 2>&1; then
     while IFS='=' read -r k v; do
         [[ -n "${k}" ]] && export "${k}=${v}"
-    done < <(yq e '.extra_env // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "${CONFIG}")
+    done < <(yq e '.ENV // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "${CONFIG}")
 fi
 
 : "${NNODES:=1}" "${NODE_RANK:=0}" "${MASTER_ADDR:=localhost}" "${MASTER_PORT:=29500}"

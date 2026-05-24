@@ -23,8 +23,11 @@ model_type: qwen2_5_omni_retention
 loss_type: retention_loss
 
 # Head-type and CoT loss weight are env-var-driven (read by the plugin).
-# Set them in the launcher (sft.sh exports them from the YAML below).
-extra_env:
+# Key name "ENV" is mandatory: ms-swift's parse_yaml_args pops this from the
+# YAML and writes os.environ before SwiftSft initializes (see
+# swift/cli/main.py:53). Any other key name (e.g. extra_env) becomes a
+# remaining_argv error.
+ENV:
   RETENTION_HEAD_TYPE: hazard
   RETENTION_COT_ALPHA: '0.1'                # try {0.05, 0.1, 0.2}
 
@@ -36,11 +39,21 @@ lazy_tokenize: true
 strict: false
 dataset_num_proc: 1
 group_by_length: false
+# Required: the retention plugin's _data_collator reads R from the raw row
+# (via _extra_kwargs) to build r_true / r_mask. Removing unused columns
+# strips R before collation.
+remove_unused_columns: false
 
 tuner_type: lora
 lora_rank: 16
 lora_alpha: 32
 target_modules: all-linear
+# Keep the retention_head trainable AND persist its weights in
+# adapter_model.safetensors. Without this, peft freezes non-LoRA params and
+# the checkpoint contains only LoRA deltas — the random-init head would be
+# unrecoverable.
+modules_to_save:
+  - retention_head
 freeze_vit: true
 freeze_aligner: true
 
