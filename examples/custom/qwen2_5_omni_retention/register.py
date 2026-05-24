@@ -39,7 +39,8 @@ from typing import Optional
 from swift.loss import BaseLoss, loss_map
 from swift.model import (Model, ModelGroup, ModelLoader, ModelMeta, MultiModelKeys,
                          register_model, register_model_arch)
-from swift.template import Template, TemplateMeta, register_template
+from swift.template import register_template
+from swift.template.templates.qwen import Qwen2_5OmniTemplate, QwenTemplateMeta
 from swift.utils import get_env_args, get_logger
 
 logger = get_logger()
@@ -269,8 +270,10 @@ register_model(
 
 # ---- Template (data collator that carries r_true / r_mask) -------------
 
-class Qwen2_5OmniRetentionTemplate(Template):
-    """Inherits the stock Qwen2.5-Omni template and adds two batch tensors:
+class Qwen2_5OmniRetentionTemplate(Qwen2_5OmniTemplate):
+    """Inherits the stock Qwen2.5-Omni template (all multimodal handling:
+    audio/video token expansion, mrope position ids, padding-free, etc.)
+    and adds two batch tensors:
 
       r_true : (B, T_MAX)  float, NaN-padded for t >= T_i
       r_mask : (B, T_MAX)  bool,  True for t < T_i
@@ -288,8 +291,7 @@ class Qwen2_5OmniRetentionTemplate(Template):
         elif isinstance(inputs, dict):
             R = inputs.get('R')
         if R is None:
-            # No retention target on this row (e.g. inference). Leave absent.
-            return enc
+            return enc                                            # inference path
         T_i = max(0, len(R) - 1)
         r_true = torch.full((T_MAX,), float('nan'))
         r_mask = torch.zeros(T_MAX, dtype=torch.bool)
@@ -302,21 +304,22 @@ class Qwen2_5OmniRetentionTemplate(Template):
         return enc
 
     def _data_collator(self, batch, *, padding_to=None):
+        # Super handles position_ids, packed_seq_params, padding_free,
+        # multimodal mm_data, etc. We just stack our per-sample tensors
+        # on top — they pass through to model.forward as kwargs and get
+        # captured by the retention patch.
         res = super()._data_collator(batch, padding_to=padding_to)
-        if 'r_true' in batch[0]:
+        if batch and 'r_true' in batch[0]:
             res['r_true'] = torch.stack([b['r_true'] for b in batch])
             res['r_mask'] = torch.stack([b['r_mask'] for b in batch])
         return res
 
 
+# Reuse the stock Qwen template meta (chat-template strings, stop words,
+# default system, agent_template='hermes', etc.) — swap only template_cls.
 register_template(
-    TemplateMeta(
+    QwenTemplateMeta(
         'qwen2_5_omni_retention',
-        prefix=[''],
-        prompt=['<|im_start|>user\n{{QUERY}}<|im_end|>\n<|im_start|>assistant\n'],
-        chat_sep=['<|im_end|>\n'],
-        suffix=['<|im_end|>'],
-        system_prefix=['<|im_start|>system\n{{SYSTEM}}<|im_end|>\n'],
         template_cls=Qwen2_5OmniRetentionTemplate,
     ))
 
