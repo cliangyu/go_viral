@@ -1,0 +1,68 @@
+# Variant V3-full — SFT, retention head (hazard), FULL fine-tune, WITH CoT.
+#
+# Same architecture as sft_retention_hazard_lora_with_cot.yaml but full FT.
+# This is the spec-compliant track per wanjia milestone §6.
+#
+# Custom model_type qwen2_5_omni_retention with a softplus hazard head
+# reading the hidden state at the last </cot> token. R(t) = exp(-cumsum(λ))
+# is monotone non-increasing by construction.
+#
+# Joint loss L = log-hazard MSE + RETENTION_COT_ALPHA * LM cross-entropy on
+# the CoT span.
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+# Head-type and CoT loss weight are env-var-driven (read by the plugin).
+# ENV key is mandatory — see swift/cli/main.py:53.
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_COT_ALPHA: '0.1'
+
+# CoT-distilled dataset; rows carry R or R_true (plugin accepts either).
+dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.under60s.jsonl
+max_length: 24576
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+# Required: the retention plugin's _data_collator reads R from the raw row
+# (via _extra_kwargs) to build r_true / r_mask. Removing unused columns
+# strips R before collation.
+remove_unused_columns: false
+
+# Full FT; freeze the audio/visual towers and aligner to match milestone spec.
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+
+# Full FT needs ZeRO-3 to fit the optimizer state (Adam fp32 ≈ 8× param size).
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false                          # head is too small to amortize compile
+deepspeed: zero3
+
+num_train_epochs: 10
+learning_rate: 5.0e-6                         # full-FT range (matches H2)
+warmup_ratio: 0.05
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+logging_steps: 1
+eval_steps: 50
+save_steps: 50
+save_total_limit: 3
+report_to: [tensorboard]
+
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

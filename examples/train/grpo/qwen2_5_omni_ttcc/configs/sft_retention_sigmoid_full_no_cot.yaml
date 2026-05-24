@@ -1,0 +1,54 @@
+# Variant V4-full — SFT, retention head (sigmoid), FULL fine-tune, NO CoT.
+#
+# SFT-MSE literature anchor (wanjia milestone §5): sigmoid head on the last
+# non-pad hidden state, per-second MSE loss on R(t). Full FT to match the
+# spec-compliant track.
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+ENV:
+  RETENTION_HEAD_TYPE: sigmoid
+  RETENTION_COT_ALPHA: '0.0'                  # no CoT → no auxiliary LM loss
+
+dataset: /home/ssm-user/work/data/ttcc_swift_v2cot_nocot/ttcc_train_sft.filtered116.jsonl
+max_length: 24576
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+deepspeed: zero3
+
+num_train_epochs: 10
+learning_rate: 5.0e-6
+warmup_ratio: 0.05
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+logging_steps: 1
+eval_steps: 50
+save_steps: 50
+save_total_limit: 3
+report_to: [tensorboard]
+
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_sigmoid_full_no_cot
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

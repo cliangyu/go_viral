@@ -213,6 +213,50 @@ def _make_retention_forward(original_forward, head: RetentionHead,
     return forward
 
 
+def _maybe_load_retention_head_from_dir(head: 'RetentionHead', model_dir: str) -> None:
+    """Restore retention_head.* weights from a saved checkpoint dir, if present.
+
+    Handles both layouts produced by HF Trainer under full-FT:
+      - sharded: model.safetensors.index.json + model-00001-of-NN.safetensors
+      - single:  model.safetensors
+
+    Silent no-op if neither file exists (initial training run, not a reload).
+    Silent no-op if the safetensors contains no retention_head.* keys (e.g.
+    base Qwen checkpoint with no head trained).
+    """
+    import json
+    import os
+    from safetensors.torch import load_file
+
+    index_path = os.path.join(model_dir, 'model.safetensors.index.json')
+    single_path = os.path.join(model_dir, 'model.safetensors')
+
+    head_state: dict = {}
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            idx = json.load(f)
+        weight_map = idx.get('weight_map', {})
+        shards_to_read = {weight_map[k] for k in weight_map
+                          if k.startswith('retention_head.')}
+        for shard in shards_to_read:
+            sd = load_file(os.path.join(model_dir, shard))
+            for k, v in sd.items():
+                if k.startswith('retention_head.'):
+                    head_state[k[len('retention_head.'):]] = v
+    elif os.path.exists(single_path):
+        sd = load_file(single_path)
+        for k, v in sd.items():
+            if k.startswith('retention_head.'):
+                head_state[k[len('retention_head.'):]] = v
+    if not head_state:
+        return                                                # initial training run
+
+    missing, unexpected = head.load_state_dict(head_state, strict=False)
+    logger.info(f'Restored retention_head from checkpoint: '
+                f'{sorted(head_state.keys())} '
+                f'(missing={list(missing)}, unexpected={list(unexpected)})')
+
+
 # ---- ModelLoader: wires the head onto the base model on load -----------
 
 class Qwen2_5OmniRetentionLoader(ModelLoader):
@@ -262,6 +306,18 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         # Register the head as a submodule so it participates in
         # save_pretrained / state_dict / DDP wrapping.
         model.retention_head = head
+
+        # If this is a resume / reload (full-FT checkpoint), the trained
+        # retention_head.* weights live in the safetensors but were just
+        # dropped by HF's from_pretrained as UNEXPECTED keys (because the
+        # base Qwen2_5OmniForConditionalGeneration class doesn't declare
+        # retention_head). Restore them now into the freshly-attached head.
+        #
+        # LoRA checkpoints are handled by peft's modules_to_save path, not
+        # here — they go through adapter_model.safetensors with prefixed
+        # keys like base_model.model.retention_head.* and are restored by
+        # set_peft_model_state_dict downstream of this loader.
+        _maybe_load_retention_head_from_dir(head, model_dir)
 
         # Resolve the </cot> anchor token ids once at load time.
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -355,10 +411,12 @@ class Qwen2_5OmniRetentionTemplate(Qwen2_5OmniTemplate):
     def _encode(self, inputs):
         enc = super()._encode(inputs)
         R = None
+        # Accept either 'R' (build_ttcc_jsonl schema) or 'R_true' (Wanjia's
+        # legacy v2cot schema). Same semantics: the per-second retention curve.
         if hasattr(inputs, 'extra') and isinstance(inputs.extra, dict):
-            R = inputs.extra.get('R')
+            R = inputs.extra.get('R') or inputs.extra.get('R_true')
         elif isinstance(inputs, dict):
-            R = inputs.get('R')
+            R = inputs.get('R') or inputs.get('R_true')
         if R is None:
             return enc                                            # inference path
         T_i = max(0, len(R) - 1)
@@ -397,10 +455,11 @@ class Qwen2_5OmniRetentionTemplate(Qwen2_5OmniTemplate):
         else:
             R_list = []
             for b in batch:
-                R = b.get('R')
+                R = b.get('R') or b.get('R_true')
                 if R is None:
                     ek = b.get('_extra_kwargs') or {}
-                    R = ek.get('R') if isinstance(ek, dict) else None
+                    if isinstance(ek, dict):
+                        R = ek.get('R') or ek.get('R_true')
                 R_list.append(R)
             if any(R is not None for R in R_list):
                 r_trues, r_masks = [], []
