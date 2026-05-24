@@ -132,30 +132,49 @@ def main():
         # anchor lands in the right place. template.encode expects
         # TemplateInputs (which wraps StdTemplateInputs in chosen/rejected/etc),
         # not bare StdTemplateInputs.
+        #
+        # Production val sets contain occasional bad rows (audio decode
+        # failure, row over max_length, missing video file). Match training's
+        # truncation_strategy=delete behaviour: skip the row, count it,
+        # continue. Don't let one bad row sink the whole eval.
         from swift.template.template_inputs import TemplateInputs
+        from swift.template.base import MaxLengthError
         ti = TemplateInputs.from_dict(row)
-        enc = template.encode(ti)
+        try:
+            enc = template.encode(ti)
+        except MaxLengthError as e:
+            print(f'[eval] ad {i:3d}: skip (max_length: {str(e)[:80]})')
+            skipped += 1
+            continue
+        except Exception as e:
+            print(f'[eval] ad {i:3d}: skip (encode {type(e).__name__}: {str(e)[:80]})')
+            skipped += 1
+            continue
         if not enc:
             skipped += 1
             continue
 
-        # Move tensors to GPU
-        batch = template.data_collator([enc])
-        batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-
-        with torch.no_grad():
-            out = model(**batch)
-            r_pred = getattr(out, 'r_pred', None)
-            if r_pred is None:
-                holder = getattr(model, '_retention_h_holder', None)
-                r_pred = holder.r_pred if holder is not None else None
-            if r_pred is None:
-                print(f'[eval] row {i}: r_pred MISSING')
-                skipped += 1
-                continue
-            # r_pred is (1, 60); take first :T_i+1, force R(0)=1
-            R_pred = r_pred[0].float().cpu().numpy()
-            R_pred_full = np.concatenate([[1.0], R_pred])[: T_i + 1]
+        # Move tensors to GPU and forward
+        try:
+            batch = template.data_collator([enc])
+            batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+            with torch.no_grad():
+                out = model(**batch)
+                r_pred = getattr(out, 'r_pred', None)
+                if r_pred is None:
+                    holder = getattr(model, '_retention_h_holder', None)
+                    r_pred = holder.r_pred if holder is not None else None
+                if r_pred is None:
+                    print(f'[eval] ad {i:3d}: r_pred MISSING')
+                    skipped += 1
+                    continue
+                # r_pred is (1, 60); take first :T_i+1, force R(0)=1
+                R_pred = r_pred[0].float().cpu().numpy()
+                R_pred_full = np.concatenate([[1.0], R_pred])[: T_i + 1]
+        except Exception as e:
+            print(f'[eval] ad {i:3d}: skip (forward {type(e).__name__}: {str(e)[:80]})')
+            skipped += 1
+            continue
 
         ibs_model = per_ad_ibs(R_pred_full, R_true, T_i)
         ibs_b1 = per_ad_ibs(B1_curve[: T_i + 1], R_true, T_i)

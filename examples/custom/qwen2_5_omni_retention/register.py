@@ -318,6 +318,17 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         # keys like base_model.model.retention_head.* and are restored by
         # set_peft_model_state_dict downstream of this loader.
         _maybe_load_retention_head_from_dir(head, model_dir)
+        # Move the head to the model's device/dtype. RetentionHead is
+        # constructed on CPU in fp32 (intentional for cumsum/exp stability),
+        # but the rest of the model may already be on CUDA via
+        # model_kwargs={'device_map': 'cuda'}. Training under DeepSpeed
+        # would move everything during initialize(), but inference paths
+        # (eval, RL rollouts) call forward directly and need this here.
+        try:
+            target_device = next(model.parameters()).device
+            head.to(target_device)
+        except StopIteration:
+            pass
 
         # Resolve the </cot> anchor token ids once at load time.
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
