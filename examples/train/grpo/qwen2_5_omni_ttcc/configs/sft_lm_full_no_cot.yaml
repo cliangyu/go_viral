@@ -1,0 +1,54 @@
+# Variant V1 — SFT, language emission, full fine-tune, no CoT.
+#
+# The model writes the retention curve as a numeric token sequence in the
+# assistant turn. Standard LM cross-entropy. No custom head.
+#
+# Provenance: this is the recipe currently running at v20-20260523-193206,
+# expressed as a YAML for the new launcher.
+
+# --- Model ---
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+# --- Data ---
+dataset: /home/ssm-user/work/data/ttcc_swift_v2cot_nocot/ttcc_train_sft.jsonl
+max_length: 24576
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+
+# --- Tuning ---
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+
+# --- Memory / speed ---
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: true
+deepspeed: zero3
+
+# --- Schedule (effective batch = 1 * 8 * NPROC_PER_NODE) ---
+num_train_epochs: 10
+learning_rate: 1.0e-5
+warmup_ratio: 0.05
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+# --- Logging / ckpt ---
+logging_steps: 5
+eval_steps: 50
+save_steps: 50
+save_total_limit: 3
+report_to: [tensorboard, wandb]
+
+# --- I/O ---
+output_dir: /opt/dlami/nvme/ssm-out/sft_lm_full_no_cot
+
+# --- Dataloader ---
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

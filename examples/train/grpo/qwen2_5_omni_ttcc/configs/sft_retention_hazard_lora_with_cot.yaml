@@ -1,0 +1,69 @@
+# Variant V3 — SFT, retention head (hazard), LoRA, WITH CoT.
+#
+# Custom model_type qwen2_5_omni_retention with a softplus hazard head
+# reading the hidden state at the last </cot> token. R(t) = exp(-cumsum(λ))
+# is monotone non-increasing by construction.
+#
+# Matches wanjia milestone §6 (SFT-Hazard+CoT). LoRA tuning, joint loss
+# L = log-hazard MSE + RETENTION_COT_ALPHA * LM cross-entropy on the CoT
+# span.
+#
+# Reference: DeepHit (Lee et al., AAAI 2018), SurvTRACE (Wang & Sun,
+# CHIL 2022), pycox, lifelines.
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+# Retention plugin: registers model_type qwen2_5_omni_retention and
+# loss_type retention_loss.
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+# Head-type and CoT loss weight are env-var-driven (read by the plugin).
+# Set them in the launcher (sft.sh exports them from the YAML below).
+extra_env:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_COT_ALPHA: '0.1'                # try {0.05, 0.1, 0.2}
+
+# CoT-distilled dataset; rows carry an R field (list of T_i+1 floats).
+dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.jsonl
+max_length: 24576
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32
+target_modules: all-linear
+freeze_vit: true
+freeze_aligner: true
+
+# LoRA → ZeRO-2 (optimizer state is tiny; less comm than ZeRO-3).
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false                          # head is too small to amortize compile
+deepspeed: zero2
+
+num_train_epochs: 10
+learning_rate: 1.0e-4                         # LoRA tolerates higher LR
+warmup_ratio: 0.05
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+logging_steps: 5
+eval_steps: 50
+save_steps: 50
+save_total_limit: 3
+report_to: [tensorboard, wandb]
+
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_with_cot
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4
