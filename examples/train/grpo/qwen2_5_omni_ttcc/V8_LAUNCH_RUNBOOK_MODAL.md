@@ -250,22 +250,42 @@ def train():
 
     # --- Stage 2: videos. Either staged once or streamed from HF every retry. ---
     videos_dir = Path("/vol/data/videos")
-    if not videos_dir.exists() or len(list(videos_dir.glob("*.mp4"))) < 39000:
-        # First-time: pull liangyuch/ttcc-v0_2_0 + extract MP4s
-        # This is the ~935 GB step. ETA 2-6h depending on Modal's HF cache.
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    n_mp4 = len(list(videos_dir.glob("*.mp4")))
+    if n_mp4 < 39000:
+        # First-time staging. ETA: 2-6h depending on Modal's HF cache.
+        # Step 1: pull parquet shards (~935 GB embedded video bytes).
         subprocess.run([
             "huggingface-cli", "download", "liangyuch/ttcc-v0_2_0",
             "--repo-type", "dataset",
             "--local-dir", "/vol/data/hf_ttcc",
         ], check=True)
-        # Extract videos from parquet rows → /vol/data/videos/<ad_id>.mp4
-        # (use the same script the AWS path uses: scripts/extract_videos_from_hf.py)
+        # Step 2: extract MP4s from parquet rows -> /vol/data/videos/<ad_id>.mp4
         subprocess.run([
-            "python", "/opt/go_viral/examples/train/grpo/qwen2_5_omni_ttcc/scripts/extract_videos_from_hf.py",
-            "--hf-dir", "/vol/data/hf_ttcc",
+            "python",
+            "/opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/extract_videos_from_hf.py",
+            "--hf-dir",  "/vol/data/hf_ttcc",
             "--out-dir", str(videos_dir),
+            "--split",   "train",
         ], check=True)
         vol.commit()                                        # persist before training
+
+    # --- Stage 2b: rewrite video paths in the V8 jsonl to Volume paths. ---
+    # The jsonl as uploaded references /home/ssm-user/... AWS paths.
+    # On Modal those don't exist — rewrite to /vol/data/videos/<ad_id>.mp4.
+    train_repathed = train_jsonl.with_suffix(".modal.jsonl")
+    if not train_repathed.exists():
+        import json
+        with open(train_jsonl) as fin, open(train_repathed, "w") as fout:
+            for line in fin:
+                r = json.loads(line)
+                ad_id = r["ad_id"]
+                mp4 = f"/vol/data/videos/{ad_id}.mp4"
+                r["videos"] = [mp4]
+                r["audios"] = [mp4]
+                fout.write(json.dumps(r) + "\n")
+        vol.commit()
+    train_jsonl = train_repathed
 
     # --- Stage 3: launch training. Auto-resume from latest ckpt. ---
     out_dir = Path("/vol/output/sft_retention_hazard_full_with_cot")
