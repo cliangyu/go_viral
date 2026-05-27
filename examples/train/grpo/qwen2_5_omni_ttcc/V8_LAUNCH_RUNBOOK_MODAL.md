@@ -1,66 +1,106 @@
 # V8 Launch Runbook — Modal (Wanjia)
 
 Companion to [V8_LAUNCH_RUNBOOK.md](V8_LAUNCH_RUNBOOK.md) (the AWS H100 path).
-This doc covers the Modal LoRA path. You already have a working V7-hazard-LoRA
-Modal pipeline; this is the V8 **delta**, not a from-scratch rebuild.
 
-## TL;DR — what's different in V8
+**Goal: replicate the AWS run exactly on Modal.** Same yaml, same data, same
+architecture (full FT 8×H100, ZeRO-3, hazard head + CoT, α=1e-3). The only
+delta is the platform (Modal container + Volume vs AWS SSM + NVMe), so the
+two runs constitute a clean reproducibility A/B.
 
-| Aspect | V7 (your old run) | V8 (this run) |
+## What V8 is (and why this run exists)
+
+V7's training data put ground-truth R(t) in the assistant span. The hazard
+head reading h[last token] trivially echoed it. Three audits (randomization
+probe, video-swap, constant-predictor sanity) confirm V7's backbone
+**did not use video**. V8 fixes this by:
+
+- Replacing the leaky assistant span with Gemini-distilled `<cot>…</cot>` reasoning
+- Anchoring the hazard head at h[last `</cot>` token] (downstream of all
+  reasoning, upstream of any structured output — anti-leak by design)
+- Adding a joint LM-CE loss on the CoT span with α=1e-3
+
+V8 trains from **base Qwen2.5-Omni-3B**, never from V7 ckpts (the leak path
+is baked into V7's weights).
+
+See `INCIDENT_2026-05-26_EVAL_LEAK.md` in `ttcc-eval` for the full review.
+
+## Hardware target
+
+**8×H100 single container** (same shape as AWS p5.48xlarge):
+- `gpu="H100:8"` in Modal = 640 GB GPU RAM on one machine, NVLink
+- Modal docs caveat: requesting >2 GPUs incurs longer wait times in the queue,
+  so submit early
+- Pricing: $3.95/hr × 8 = **$31.60/hr**
+- Estimated wall-clock: 45–60h for V8 full FT (10 epochs × ~4400 steps)
+- Estimated cost: **~$1,500–$1,900 per run**
+
+Alternative: 8×H200 if your account has access ($4.54×8 = $36.32/hr, ~15% faster).
+
+## The 24-hour boundary (Modal-specific gotcha)
+
+Modal hard-caps single function executions at **24h**. V8 needs ~50h. The
+official pattern (from [modal.com/docs/examples/long-training](https://modal.com/docs/examples/long-training)):
+
+```python
+@app.function(
+    gpu="H100:8",
+    timeout=86400,                                  # 24h max
+    retries=modal.Retries(max_retries=10, initial_delay=0.0),
+    volumes={"/vol": modal.Volume.from_name("ttcc-v8")},
+)
+def train():
+    ...
+```
+
+When the 24h timer expires, Modal kills the container and the retry policy
+spawns a fresh one. The new container mounts the same Volume → ms-swift's
+`--resume_from_checkpoint` picks up from the last saved step. Save every 75
+steps (already in yaml) so at most 75 steps × ~40s = ~50 minutes of work is
+re-done after each boundary.
+
+**Don't use `infinity` for `timeout`** — Modal will reject it for GPU jobs.
+
+## Pre-launch — what to provision
+
+### 1. Modal Secrets
+
+Create these in the Modal dashboard (one-time, reused across all runs):
+
+| Secret name | Contents | Used for |
 |---|---|---|
-| **Training data** | `ttcc_train_sft.jsonl` (R(t) in assistant span — LEAKY) | `ttcc_train_with_cot.jsonl` (assistant = `<cot>…</cot>` only) |
-| **Architecture** | hazard head reads h[last input token] | hazard head reads h[last `</cot>` token] |
-| **Joint loss** | MSE only | MSE + α · LM-CE on CoT span |
-| **α (CoT weight)** | n/a | **1e-3** (was 0.1 in earlier hazard-LoRA config — outdated) |
-| **Init** | from base or V7 LoRA | **from base Qwen2.5-Omni-3B** (never from V7 ckpts — they have the leak path baked in) |
-| **Yaml** | `sft_retention_hazard_lora_no_cot.yaml` (deprecated) | `sft_retention_hazard_lora_with_cot.yaml` (needs the patch below) |
+| `hf-token` | `HF_TOKEN=<your hf token>` | Pull base model + dataset, push checkpoints |
+| `wandb-key` | `WANDB_API_KEY=<your wandb key>` | Run tracking |
 
-**Why V8 exists**: V7's training data put ground-truth R(t) in the assistant
-span. The hazard head reading h[last token] trivially echoed it. Three audits
-(randomization probe, video-swap, constant-predictor) confirm V7's backbone
-**did not use video**. V8 fixes this by (a) clearing R(t) out of the assistant
-span and (b) replacing it with Gemini-distilled CoT reasoning.
+You do **not** need AWS credentials. You do **not** need a GitHub PAT (the
+`ttcc-rl` branch on `cliangyu/go_viral` is public).
 
-See `INCIDENT_2026-05-26_EVAL_LEAK.md` in the `ttcc-eval` repo for the full
-incident review.
+### 2. Modal Volume
 
-## What experiment to run
+```bash
+modal volume create ttcc-v8
+```
 
-**V8 LoRA + CoT** (matches `sft_retention_hazard_lora_with_cot.yaml`).
+Layout it will hold (~1 TB total):
+```
+/vol/hf-cache/Qwen2.5-Omni-3B/        # base model, ~6 GB
+/vol/data/ttcc_v8/                     # train + val jsonl, ~60 MB
+/vol/data/videos/                      # 39K MP4s, ~935 GB
+/vol/output/sft_retention_hazard_full_with_cot/   # ckpts, ~80 GB after 10 epochs
+```
 
-This is a complementary run to the AWS full-FT path:
-- AWS Node A: V8 main — **full FT** + CoT (α=1e-3)
-- Modal (yours): V8 LoRA + CoT (α=1e-3) — **tests whether LoRA suffices**
-- AWS Node B (if available): V8 α=0 ablation — tests whether CoT supervision helps
-
-If your LoRA result is within ~5–10% IBS of full FT, that's a big win for
-cost/reproducibility. If it's much worse, full FT was necessary.
-
-## Pre-launch — what to pull from HuggingFace
+### 3. Data to pull from HuggingFace (inside container, on first run)
 
 | Asset | HF path | Notes |
 |---|---|---|
 | Base model | `Qwen/Qwen2.5-Omni-3B` | Same as V7. ~6 GB. |
-| Videos | `liangyuch/ttcc-v0_2_0` (dataset) | 61,789 rows × 51 cols with embedded video bytes. Same as your V7 pipeline. |
-| **V8 training jsonl** | **TODO Leon: upload** — currently lives on the dead 8-GPU box | 39,375 rows, ~57 MB. Each row: `messages` (sys+user+assistant CoT), `videos`, `audios`, `T`, `R`. See "Data layout" below for schema. |
-| Holdout val (leak-free) | TODO Leon: upload `val_200_no_cot.jsonl` | 200 rows, used for in-loop eval. |
+| Videos + metadata | `liangyuch/ttcc-v0_2_0` (dataset) | 61,789 rows × 51 cols with embedded video bytes; 935 GB. Same as your V7 pipeline. |
+| **V8 training jsonl** | **TODO Leon: upload to `liangyuch/ttcc-v8-train` (private)** | 39,375 rows, ~57 MB. Schema below. |
+| Holdout val (leak-free) | Same repo as above | 200 rows, used for in-loop eval. |
 
-**ACTION FOR LEON before launch**: push the V8 train jsonl + holdout val to
-HuggingFace as a private dataset repo (`liangyuch/ttcc-v8-train` or similar),
-then update this doc with the path. Until then, Wanjia rebuilds V8 jsonl from
-V7 jsonl + CoT jsonl using `tools/build_v8_train_jsonl.py` (see fallback below).
-
-## Required credentials (Wanjia's responsibility)
-
-| Credential | Where on Modal | Why |
-|---|---|---|
-| HF token | Modal Secret (`hf-token` or similar), read into env as `HF_TOKEN` | Pull base model + dataset + push checkpoints |
-| GitHub PAT | Modal Secret (only if cloning private `cliangyu/go_viral`) | Already public on the `ttcc-rl` branch, so PAT is optional |
-| wandb API key | Modal Secret, read into env as `WANDB_API_KEY` | Run tracking |
-| Vertex AI SA JSON | NOT needed | Only for generating more CoT data, which is already done |
-
-You do **not** need AWS credentials. None of V8's required data lives on S3
-once Leon uploads the jsonl to HF.
+**ACTION FOR LEON** before launch: push `ttcc_train_with_cot.jsonl` +
+`val_200_no_cot.jsonl` to HF as a private dataset and update this doc with
+the exact path. Until then, use the fallback at the bottom (rebuild from
+V7 jsonl + CoT jsonl).
 
 ## Data layout — what one row of V8 jsonl looks like
 
@@ -71,29 +111,26 @@ once Leon uploads the jsonl to HF.
     {"role": "user",      "content": "This ad is 15 seconds long. Estimate the per-second retention curve."},
     {"role": "assistant", "content": "<cot>The opening shot shows... viewers in the 18-24 segment...</cot>"}
   ],
-  "videos": ["/path/to/ad.mp4"],
-  "audios": ["/path/to/ad.mp4"],
+  "videos": ["/vol/data/videos/<ad_id>.mp4"],
+  "audios": ["/vol/data/videos/<ad_id>.mp4"],
   "T": 15,
   "R": [1.0, 0.84, 0.71, ...]
 }
 ```
 
-**Critical correctness invariants** (the V7 leak audits caught these — verify
-on at least 20 random rows before launching):
+**Critical correctness invariants** — verify on at least 50 random rows
+before launching ($1,800 mistakes hurt):
 
-1. `messages[-1]["content"]` starts with `<cot>` and ends with `</cot>` — nothing else.
-2. No decimal numbers from `R` appear anywhere inside `<cot>...</cot>`. (The
-   teacher LLM was prompted to avoid R values, but spot-check.)
-3. `videos[0]` and `audios[0]` point to the **same** MP4 path (Qwen-Omni reads
-   audio embedded in video).
-4. `len(R) == T + 1` and `R[0] == 1.0`.
-5. `R` is monotone non-increasing.
+1. `messages[-1]["content"]` starts with `<cot>` and ends with `</cot>` — nothing else
+2. No decimal numbers from `R` appear anywhere inside `<cot>...</cot>`
+3. `videos[0]` and `audios[0]` point to the same MP4 path
+4. `len(R) == T + 1` and `R[0] == 1.0`
+5. `R` is monotone non-increasing
 
-Quick check:
 ```python
-import json, re
+import json
 n_ok = 0
-with open("ttcc_train_with_cot.jsonl") as f:
+with open("/vol/data/ttcc_v8/ttcc_train_with_cot.jsonl") as f:
     for i, line in enumerate(f):
         d = json.loads(line)
         a = d["messages"][-1]["content"]
@@ -109,143 +146,229 @@ with open("ttcc_train_with_cot.jsonl") as f:
 print(f"{n_ok} rows validated")
 ```
 
-## The V8 LoRA yaml (patch from current `sft_retention_hazard_lora_with_cot.yaml`)
+## The yaml to use
 
-The yaml at `examples/train/grpo/qwen2_5_omni_ttcc/configs/sft_retention_hazard_lora_with_cot.yaml`
-is the right starting point but **needs three small patches** to match V8:
+`examples/train/grpo/qwen2_5_omni_ttcc/configs/sft_retention_hazard_full_with_cot.yaml`
 
-```diff
- ENV:
-   RETENTION_HEAD_TYPE: hazard
--  RETENTION_COT_ALPHA: '0.1'
-+  RETENTION_COT_ALPHA: '1e-3'         # principled balance: CoT ~3e-3 vs curve ~0.1
-
--dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.jsonl
-+dataset: <YOUR MODAL PATH TO ttcc_train_with_cot.jsonl>
-+val_dataset: <YOUR MODAL PATH TO val_200_no_cot.jsonl>
-+eval_strategy: steps
-
--max_length: 32768
-+max_length: 49152                     # eliminates the ~18% drop rate at 32768
-```
-
-Why these specifically:
-- **α=1e-3**: with random-init head from base (curve MSE ~0.1 at start), this
-  makes CoT-CE contribution ~3% of total loss — small enough to let the head
-  converge, large enough to drive LM head learning. α=0.1 (the old value) was
-  tuned for warm-start from a converged head and would over-weight CoT here.
-- **max_length=49152**: at 32768, ~18% of training rows get dropped due to
-  long ad videos exceeding 33K–45K tokens. 49152 gives 0 drops on the 300-ad
-  sample we tested.
-- **val_dataset + eval_strategy=steps**: critical for catching divergence
-  early. Use the leak-free holdout (assistant span empty).
-
-Everything else in the LoRA yaml (rank=16, α=32, `modules_to_save:
-retention_head`, lr=1e-4, ZeRO-2) stays.
-
-## Inference-time anchor — what changed under the hood
-
-The hazard head now reads h at the **last `</cot>` token** instead of the
-last input token. This is the anti-leak design: if some `<cot>` content gets
-malformed in the future, the head still attends to a deterministic anchor
-that's downstream of all reasoning but upstream of any structured output.
-
-The plugin (`examples/custom/qwen2_5_omni_retention/register.py`) does this
-automatically — no code change needed on your end. Fallback: if no `</cot>`
-is found, it falls back to h[last input token] (same as V7) so this is
-backward-compatible.
-
-## Launch command (your Modal app)
-
-In your existing Modal app, the training launcher should call:
+**Use this verbatim** — same one the AWS run uses. The only Modal-specific
+overrides happen at the CLI:
 
 ```bash
-# Inside the Modal container:
-export RETENTION_HEAD_TYPE=hazard
-export RETENTION_COT_ALPHA=1e-3
-export PYTHONPATH=/path/to/ms-swift
-
-NPROC_PER_NODE=$N_GPUS \
 swift sft \
-  --config_file examples/train/grpo/qwen2_5_omni_ttcc/configs/sft_retention_hazard_lora_with_cot.yaml \
-  --dataset $V8_TRAIN_JSONL \
-  --val_dataset $V8_VAL_JSONL \
-  --max_length 49152 \
-  --output_dir $OUT_DIR
+  --config_file examples/train/grpo/qwen2_5_omni_ttcc/configs/sft_retention_hazard_full_with_cot.yaml \
+  --model /vol/hf-cache/Qwen2.5-Omni-3B \
+  --dataset /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl \
+  --val_dataset /vol/data/ttcc_v8/val_200_no_cot.jsonl \
+  --output_dir /vol/output/sft_retention_hazard_full_with_cot
+  # add --resume_from_checkpoint <ckpt-path> on retry runs (see below)
 ```
 
-CLI flags override yaml. This lets you patch dataset/val paths without
-modifying the yaml itself.
+Config recap (do not change):
+- `tuner_type: full`, `deepspeed: zero3`
+- `learning_rate: 5.0e-6`, `num_train_epochs: 10`
+- `max_length: 49152` (eliminates ~18% drop rate seen at 32768)
+- `RETENTION_HEAD_TYPE=hazard`, `RETENTION_COT_ALPHA=1e-3`
+- `save_steps: 75`, `save_total_limit: 10`
 
-## Fallback: if Leon hasn't uploaded the V8 jsonl yet
+## Modal app skeleton
 
-You can rebuild it locally on Modal from V7 jsonl + CoT jsonl. Both are
-mirrored on HuggingFace under datasets Leon controls (or in private S3 if HF
-isn't ready):
+```python
+# train_v8.py
+import modal
+import subprocess
+import os
+from pathlib import Path
 
+app = modal.App("ttcc-v8")
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "ffmpeg", "libgl1")
+    .pip_install("torch==2.4.0", "transformers", "deepspeed==0.15.2",
+                 "flash-attn==2.8.3", "huggingface_hub", "wandb",
+                 "tensorboard", "qwen-omni-utils")
+    .run_commands(
+        "git clone -b ttcc-rl https://github.com/cliangyu/go_viral.git /opt/go_viral",
+        "cd /opt/go_viral && pip install -e .",
+    )
+)
+
+vol = modal.Volume.from_name("ttcc-v8", create_if_missing=True)
+
+@app.function(
+    image=image,
+    gpu="H100:8",
+    timeout=86400,                                          # 24h ceiling
+    retries=modal.Retries(max_retries=10, initial_delay=0.0),
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("hf-token"),
+             modal.Secret.from_name("wandb-key")],
+)
+def train():
+    os.environ["HF_HOME"] = "/vol/hf-cache"
+    os.environ["RETENTION_HEAD_TYPE"] = "hazard"
+    os.environ["RETENTION_COT_ALPHA"] = "1e-3"
+    os.environ["WANDB_PROJECT"] = "ttcc-v8"
+    os.environ["WANDB_NAME"] = f"v8_main_modal_{os.environ.get('MODAL_TASK_ID','')[:8]}"
+
+    # --- Stage 1: ensure base model + data present (no-op on retry) ---
+    base = Path("/vol/hf-cache/Qwen2.5-Omni-3B")
+    if not (base / "config.json").exists():
+        subprocess.run([
+            "huggingface-cli", "download", "Qwen/Qwen2.5-Omni-3B",
+            "--local-dir", str(base),
+        ], check=True)
+
+    train_jsonl = Path("/vol/data/ttcc_v8/ttcc_train_with_cot.jsonl")
+    if not train_jsonl.exists():
+        # Pull from HF (Leon should have uploaded by now); or rebuild from V7 + CoT
+        raise SystemExit("V8 training jsonl missing — pull from HF or use fallback path")
+
+    val_jsonl = Path("/vol/data/ttcc_v8/val_200_no_cot.jsonl")
+    assert val_jsonl.exists(), "holdout val jsonl missing"
+
+    # --- Stage 2: videos. Either staged once or streamed from HF every retry. ---
+    videos_dir = Path("/vol/data/videos")
+    if not videos_dir.exists() or len(list(videos_dir.glob("*.mp4"))) < 39000:
+        # First-time: pull liangyuch/ttcc-v0_2_0 + extract MP4s
+        # This is the ~935 GB step. ETA 2-6h depending on Modal's HF cache.
+        subprocess.run([
+            "huggingface-cli", "download", "liangyuch/ttcc-v0_2_0",
+            "--repo-type", "dataset",
+            "--local-dir", "/vol/data/hf_ttcc",
+        ], check=True)
+        # Extract videos from parquet rows → /vol/data/videos/<ad_id>.mp4
+        # (use the same script the AWS path uses: scripts/extract_videos_from_hf.py)
+        subprocess.run([
+            "python", "/opt/go_viral/examples/train/grpo/qwen2_5_omni_ttcc/scripts/extract_videos_from_hf.py",
+            "--hf-dir", "/vol/data/hf_ttcc",
+            "--out-dir", str(videos_dir),
+        ], check=True)
+        vol.commit()                                        # persist before training
+
+    # --- Stage 3: launch training. Auto-resume from latest ckpt. ---
+    out_dir = Path("/vol/output/sft_retention_hazard_full_with_cot")
+    latest_ckpt = None
+    if out_dir.exists():
+        ckpts = sorted(out_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]))
+        if ckpts:
+            latest_ckpt = str(ckpts[-1])
+
+    cmd = [
+        "swift", "sft",
+        "--config_file", "/opt/go_viral/examples/train/grpo/qwen2_5_omni_ttcc/configs/sft_retention_hazard_full_with_cot.yaml",
+        "--model", str(base),
+        "--dataset", str(train_jsonl),
+        "--val_dataset", str(val_jsonl),
+        "--output_dir", str(out_dir),
+        "--save_only_model", "false",                       # need optimizer state for resume
+    ]
+    if latest_ckpt:
+        cmd += ["--resume_from_checkpoint", latest_ckpt]
+        print(f"RESUMING from {latest_ckpt}")
+    else:
+        print("Fresh start from base Qwen2.5-Omni-3B")
+
+    env = {**os.environ, "NPROC_PER_NODE": "8"}
+    subprocess.run(cmd, env=env, check=True, cwd="/opt/go_viral")
+    vol.commit()
+
+@app.local_entrypoint()
+def main():
+    train.remote()
+```
+
+Run with:
 ```bash
-# Pull V7 train jsonl + CoT jsonl from wherever Leon staged them
-# (replace these paths once Leon confirms HF upload)
-huggingface-cli download liangyuch/<v7-data-repo> --repo-type dataset --local-dir /tmp/v7_data
-huggingface-cli download liangyuch/<cot-data-repo> --repo-type dataset --local-dir /tmp/cot_data
-
-# Build V8 (merges V7 jsonl rows with CoT entries by ad_id)
-python /go_viral/examples/custom/qwen2_5_omni_retention/tools/build_v8_train_jsonl.py \
-    --v7-jsonl /tmp/v7_data/ttcc_train_sft.jsonl \
-    --cot-jsonl /tmp/cot_data/cot_v6_train.jsonl \
-    --out-jsonl /tmp/ttcc_v8/ttcc_train_with_cot.jsonl
-
-wc -l /tmp/ttcc_v8/ttcc_train_with_cot.jsonl   # should be 39,375
+modal run train_v8.py
 ```
 
-## Pre-launch sanity check
+The retries policy means you can detach after launching — Modal will
+auto-relaunch up to 10 times across the 24h boundary. Total wall-clock
+ceiling: ~240h, more than enough headroom for a 50h run.
+
+## Pre-launch sanity (inside container, one-shot)
 
 Same script as the AWS path:
 ```bash
-bash examples/custom/qwen2_5_omni_retention/tools/validate_v8_launch.sh \
-    /path/to/base/Qwen2.5-Omni-3B \
-    /path/to/ttcc_train_with_cot.jsonl \
-    /path/to/val_200_no_cot.jsonl
+bash /opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/validate_v8_launch.sh \
+    /vol/hf-cache/Qwen2.5-Omni-3B \
+    /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl \
+    /vol/data/ttcc_v8/val_200_no_cot.jsonl
+# Exits 0 = safe to launch. Exits 1 = stop and debug.
 ```
 
-Exits 0 = safe to launch. Exits 1 = stop and debug.
+You can run this as a small `@app.function(gpu="L4")` before committing to
+the 8×H100 reservation — pre-validates data + model load without burning $32/hr.
 
 ## During training — what to watch
 
-| Step range | Expected behavior | Abort if |
-|---|---|---|
-| 0 | head is random; curve MSE ~0.1, CoT-CE ~3 per token | NaN / inf in either |
-| 50 | both losses dropping; r_pred starts to look like a curve | losses stuck or rising |
-| 100–200 | curve MSE < 1e-2; eval IBS comparable | eval IBS > 0.1 (means video signal not propagating) |
-| 500+ | curve MSE plateaus around 5e-4 to 1e-3 | divergence |
+Both wandb (live) and tensorboard (from Volume) work.
 
-Save checkpoints every 50 steps (already set in yaml). Keep last 10.
+| Step range | Expected | Abort if |
+|---|---|---|
+| 0 | head random; `loss_curve` ~0.1, `loss_cot` ~3.0 per token | NaN/inf in either |
+| 50 | both losses dropping; first val IBS reported | losses stuck or rising |
+| 100–200 | `loss_curve` < 1e-2; val IBS comparable to train | val IBS > 0.1 |
+| 500+ | `loss_curve` plateaus around 5e-4 to 1e-3 | divergence |
+| ~4400 | end of 10 epochs; expected IBS < 0.005 (leak-free) | — |
+
+The plugin logs `loss_curve` and `loss_cot` separately (commit
+`d3399991`) — verify both show up in wandb.
+
+## When a retry fires
+
+Modal will email you when a container is preempted/timed-out. The next
+container starts with `MODAL_TASK_ID` different from the prior one but the
+same Volume → ms-swift sees the previous `checkpoint-*` dir and resumes.
+
+Verify after the first retry: in wandb, the step counter should be
+continuous (not reset to 0), and `loss_curve` should pick up near where it
+left off.
 
 ## What to do with the trained model
 
-1. Upload LoRA adapters + retention_head to HuggingFace:
-   `liangyuch/ttcc-sft-qwen25omni-3b-lora-cot-v8` or your preferred name.
-2. Make sure `modules_to_save: retention_head` was honored — the
-   `adapter_model.safetensors` should contain a `retention_head.weight` key.
-   If it doesn't, the head is gone and the checkpoint is useless.
-3. **Tokenizer overlay** — same gotcha as V7. After saving, copy these 6
-   files from base `Qwen2.5-Omni-3B/` into your ckpt dir before pushing:
+1. Upload to HuggingFace:
+   `liangyuch/ttcc-sft-qwen25omni-3b-v8-cot` (or whatever Leon names the V8 repo).
+2. **Tokenizer overlay** — same V7 gotcha. After saving, copy these 6 files
+   from base `Qwen2.5-Omni-3B/` into your ckpt dir before pushing:
    `added_tokens.json`, `merges.txt`, `special_tokens_map.json`, `vocab.json`,
-   `chat_template.json`, `tokenizer_config.json`. Otherwise loading the
-   ckpt later will fail with `Qwen2TokenizerFast has no attribute image_token`.
-   The ms-swift codebase now has a vendor patch for this in
-   `swift/trainers/mixin.py`, but verify it actually copied them by listing
-   the ckpt dir before pushing.
+   `chat_template.json`, `tokenizer_config.json`. Otherwise loading the ckpt
+   later will fail with `Qwen2TokenizerFast has no attribute image_token`.
+   ms-swift's `swift/trainers/mixin.py` now has a vendor patch for this, but
+   verify by listing the ckpt dir.
+3. Skip uploading `global_step*` DeepSpeed shards — they're only needed for
+   resume, not inference, and they double the upload size.
 
-## Common failure modes
+## Fallback: if Leon hasn't uploaded the V8 jsonl yet
+
+Rebuild it from V7 jsonl + CoT jsonl. Both need to be reachable — easiest is
+for Leon to upload them as a private dataset first; otherwise via temporary
+S3 → HF mirror:
+
+```bash
+huggingface-cli download liangyuch/<v7-data-repo> \
+    --repo-type dataset --local-dir /tmp/v7_data
+huggingface-cli download liangyuch/<cot-data-repo> \
+    --repo-type dataset --local-dir /tmp/cot_data
+
+python /opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/build_v8_train_jsonl.py \
+    --v7-jsonl /tmp/v7_data/ttcc_train_sft.jsonl \
+    --cot-jsonl /tmp/cot_data/cot_v6_train.jsonl \
+    --out-jsonl /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl
+wc -l /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl     # should be 39375
+```
+
+## Failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Qwen2TokenizerFast has no attribute image_token` on load | Tokenizer overlay missing | Copy the 6 files from base model into ckpt dir |
-| LoRA checkpoint has only LoRA deltas, no `retention_head.weight` | `modules_to_save` lost in CLI override | Verify the yaml's `modules_to_save: [retention_head]` survived |
-| Eval IBS stuck near 0.1 while train MSE drops | Model overfitting to train distribution / not using video | Suspicious — run the randomization probe (zero-out video pixels at inference; if IBS doesn't change much, model isn't using video) |
-| Train loss diverges around step 50 | α too high relative to curve loss | Lower α to 5e-4 |
-| Drop rate >0 at max_length | Some ads exceed 49152 tokens | Don't raise further; let those rows drop |
+| `Qwen2TokenizerFast has no attribute image_token` on load | Tokenizer overlay missing in ckpt dir | Copy the 6 files from base model into ckpt dir |
+| Retry started but step counter reset to 0 | `--resume_from_checkpoint` flag not passed | Check the `latest_ckpt` detection in the Modal function |
+| Modal complains about GPU shape | Account doesn't have 8×H100 quota | Request quota via Modal support, or fall back to 8×A100-80GB ($2.50×8=$20/hr, slightly slower) |
+| Train loss diverges around step 50 | α too high relative to curve loss | Lower α to 5e-4 (probably won't be needed at α=1e-3) |
+| Val IBS stuck near 0.1 while train loss drops | Model not using video (same failure mode as V7) | Run randomization probe: zero out video pixels at inference; if IBS doesn't change, V8 also failed |
+| Volume commit slow / fails | Modal Volume size approaching limit | Check `modal volume get ttcc-v8` size; default cap is 1 TB, request increase if needed |
 
 ## Coordination with Leon's AWS run
 
@@ -253,32 +376,36 @@ Both runs share:
 - Same training data (`ttcc_train_with_cot.jsonl`)
 - Same base init (Qwen2.5-Omni-3B)
 - Same α (1e-3)
-- Same `</cot>` anchor for the head
+- Same yaml (`sft_retention_hazard_full_with_cot.yaml`)
+- Same architecture (full FT, ZeRO-3, hazard head at h[`</cot>`])
 
-Difference: LoRA vs full FT.
+This is a **clean reproducibility A/B**: AWS vs Modal, same everything else.
+If IBS matches within ~1×10⁻⁴ on the leak-free test, we have a robust V8
+result. If they diverge, that's interesting and needs investigation.
 
-After both finish, the comparison: LoRA IBS vs full FT IBS on the
-**leak-free** test set (use `eval_ibs.py --strip-assistant` — default ON in
-the latest commit on `ttcc-rl`).
+Log into the same wandb project (`ttcc-v8`) with run names `v8_main_aws_*`
+and `v8_main_modal_*` for easy side-by-side.
 
 ## When to escalate to Leon
 
-- Tokenizer overlay broken at save time and you can't get the vendor patch to work
-- CoT data validation fails on more than ~1% of rows (this would mean the
-  Gemini distillation has a problem)
-- Eval IBS still >0.05 after 1000 steps with leak-free protocol (means V8
-  architecture is also failing, not just V7)
-- Modal billing concern (LoRA on Modal is much cheaper than full FT on AWS,
-  but full pass through 39K videos at H100 prices still adds up)
+- Modal 8×H100 quota denied → falls back to 8×A100-80GB, ~30% slower but
+  same correctness — no escalation needed unless A100 also denied
+- Tokenizer overlay broken at save time and the vendor patch isn't picking
+  it up
+- CoT data validation fails on >1% of rows → means Gemini distillation has
+  a problem, not a Modal problem
+- Eval IBS still >0.05 after 1000 steps with leak-free protocol → means V8
+  architecture is also failing, not just V7
+- Wall-clock ETA going far over 60h → check if checkpoint-resume is
+  re-doing too many steps each cycle
 
 ---
 
 ## Quick reference — what Leon owes Wanjia before 4am
 
-1. Upload V8 train jsonl + holdout val to HF (private dataset repo)
-2. Confirm whether `ttcc-rl` branch on `cliangyu/go_viral` has the latest
-   `register.py` (the one with `</cot>` anchor + per-component loss logging)
-3. Send wandb project name to log into (so AWS + Modal runs land in the
-   same project for easy comparison)
-4. Confirm HF token Wanjia is using has write access to the destination
-   repo for checkpoint upload
+1. Upload V8 train jsonl + holdout val to HF (private dataset, e.g.
+   `liangyuch/ttcc-v8-train`)
+2. Confirm `ttcc-rl` branch on `cliangyu/go_viral` has the latest
+   `register.py` (with `</cot>` anchor + per-component loss logging)
+3. Send wandb project name (suggest `ttcc-v8`) so both runs land together
+4. Confirm Wanjia's HF token has write access to the destination repo
