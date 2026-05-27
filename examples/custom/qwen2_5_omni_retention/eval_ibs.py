@@ -199,6 +199,22 @@ def main():
                          'Use with --generate-cot to compare ΔIBS = bypass IBS - full IBS. '
                          'If ΔIBS ≈ 0, the CoT is decorative; if positive, CoT is doing work. '
                          'The proposal central diagnostic of the reasoning thesis.')
+    ap.add_argument('--strip-assistant', action='store_true', default=True,
+                    help='SECURITY: strip the assistant message content before encoding. '
+                         'DEFAULT ON. The V7-era TTCC data prep stored the ground-truth R(t) '
+                         'curve inside the assistant span as `Curve: {"R": [...]}`. If the '
+                         'eval row is encoded WITH that span, the model sees the answer in '
+                         'its own input and the retention head trivially echoes it via '
+                         'h[anchor]. This flag clears the assistant span so the model must '
+                         'predict R(t) from the user-side multimodal input alone. Set --no-strip-assistant '
+                         'to reproduce the (leaky) historical V7 numbers.')
+    ap.add_argument('--no-strip-assistant', dest='strip_assistant', action='store_false',
+                    help='Disable assistant-stripping. Restores the historical (leaky) eval path.')
+    ap.add_argument('--train-jsonl', default=None,
+                    help='Optional: compute the B1 climatology baseline from this train JSONL '
+                         'instead of from val_rows themselves. Without this, B1 is computed '
+                         "from the val set you're evaluating on — a methodological leak that "
+                         "inflates B1's apparent skill (and the model's win-rate vs B1).")
     args = ap.parse_args()
 
     # 1. Import plugin to register model_type / template / loss.
@@ -209,7 +225,30 @@ def main():
     # 2. Load val rows + compute B_1.
     val_rows = load_val_rows(args.val_jsonl, args.limit)
     print(f'[eval] loaded {len(val_rows)} val rows from {args.val_jsonl}')
-    B1_curve, T_max = compute_b1(val_rows)
+
+    # Strip assistant message content (LEAK FIX). The historical V7 prep put
+    # the ground-truth R(t) into the assistant span; encoding the full row
+    # exposes the answer to the model. Default: strip; restore via --no-strip-assistant.
+    if args.strip_assistant:
+        n_stripped = 0
+        for row in val_rows:
+            msgs = row.get('messages', [])
+            for m in msgs:
+                if m.get('role') == 'assistant' and m.get('content'):
+                    m['content'] = ''
+                    n_stripped += 1
+        print(f'[eval] LEAK FIX: stripped assistant content from {n_stripped} rows '
+              '(restore historical behavior with --no-strip-assistant)')
+
+    # B1 climatology — prefer train-derived to avoid val-leak inflation.
+    if args.train_jsonl:
+        train_rows = load_val_rows(args.train_jsonl, None)
+        print(f'[eval] B1 computed from train: {len(train_rows)} rows')
+        B1_curve, T_max = compute_b1(train_rows)
+    else:
+        print(f'[eval] WARNING: B1 computed from val_rows (val-leak). '
+              'Pass --train-jsonl <train.jsonl> for a clean baseline.')
+        B1_curve, T_max = compute_b1(val_rows)
     print(f'[eval] B_1 curve length: {len(B1_curve)} (T_max={T_max})')
 
     # 3. Load model + tokenizer via ms-swift.
