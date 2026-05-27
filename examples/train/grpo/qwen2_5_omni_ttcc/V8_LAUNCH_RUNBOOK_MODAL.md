@@ -90,17 +90,21 @@ Layout it will hold (~1 TB total):
 
 ### 3. Data to pull from HuggingFace (inside container, on first run)
 
+All inputs are PUBLIC on HF. No Leon-side upload required. Your V7
+pipeline already pulls (1) and (2); (3) is the new ingredient for V8 and
+also already public.
+
 | Asset | HF path | Notes |
 |---|---|---|
-| Base model | `Qwen/Qwen2.5-Omni-3B` | Same as V7. ~6 GB. |
-| Videos + metadata | `liangyuch/ttcc-v0_2_0` (dataset) | 61,789 rows × 51 cols with embedded video bytes; 935 GB. Same as your V7 pipeline. |
-| **V8 training jsonl** | **TODO Leon: upload to `liangyuch/ttcc-v8-train` (private)** | 39,375 rows, ~57 MB. Schema below. |
-| Holdout val (leak-free) | Same repo as above | 200 rows, used for in-loop eval. |
+| (1) Base model | `Qwen/Qwen2.5-Omni-3B` | Same as V7. ~6 GB. |
+| (2) Videos + retention curves | `liangyuch/ttcc-v0_2_0` (public dataset) | 61,789 rows × 51 cols with embedded video bytes; 935 GB. Same as V7. |
+| (3) **CoT distillation** | **`liangyuch/ttcc-cot` (public dataset)** | 39,375 train rows. Schema: `{ad_id, cot, model, prompt_version}`. The `cot` field is already wrapped in `<cot>...</cot>` and leak-free. |
 
-**ACTION FOR LEON** before launch: push `ttcc_train_with_cot.jsonl` +
-`val_200_no_cot.jsonl` to HF as a private dataset and update this doc with
-the exact path. Until then, use the fallback at the bottom (rebuild from
-V7 jsonl + CoT jsonl).
+The V8 training JSONL is **built on Modal at runtime** by merging (2) + (3)
+on `ad_id` via the helper
+`examples/custom/qwen2_5_omni_retention/tools/build_v8_from_hf.py`. The
+val/test JSONLs are built from (2) only with empty assistant content
+(no CoT supervision at eval time). No pre-uploaded JSONL needed.
 
 ## Data layout — what one row of V8 jsonl looks like
 
