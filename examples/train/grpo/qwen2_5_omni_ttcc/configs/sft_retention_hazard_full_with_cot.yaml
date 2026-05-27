@@ -7,13 +7,23 @@
 # Joint loss:
 #   L = masked_MSE(R_pred, R_true) + RETENTION_COT_ALPHA * LM_CE(assistant_tokens)
 #
-# Continuation training from a converged hazard-only SFT checkpoint
-# (path under `model:` below). Initialization from the base
-# Qwen/Qwen2.5-Omni-3B is also valid but the head starts fresh.
+# Initialization from base Qwen/Qwen2.5-Omni-3B (NOT from V7 ckpts).
+#
+# IMPORTANT — why base init, not V7 ckpt:
+#
+# V7 training (no-CoT variant) had a label-in-input leak: the train data
+# put the ground-truth R(t) into the assistant span. The head read
+# h[last_input_token] (= the last `}` of the answer JSON) and trivially
+# echoed the answer. Three independent audits (randomization probe,
+# video-swap, constant-predictor sanity) confirm V7's backbone did NOT
+# learn video-retention reasoning. Initializing V8 from a V7 ckpt would
+# carry the leak-path corruption forward. Base Qwen2.5-Omni-3B has
+# pristine multimodal pre-training and is the correct starting point.
+#
+# See INCIDENT_2026-05-26_EVAL_LEAK.md (in the ttcc-eval repo) for the
+# full incident review.
 
-# Default to V7's final saved checkpoint; override at CLI if continuing
-# from a different intermediate ckpt.
-model: /opt/dlami/nvme/ckpts/checkpoint-3675
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
 torch_dtype: bfloat16
 attn_impl: flash_attn
 
@@ -25,16 +35,22 @@ loss_type: retention_loss
 # Head-type and CoT loss weight are env-var-driven (read by the plugin).
 # ENV key is mandatory — see swift/cli/main.py:53.
 #
-# Alpha scale rationale: at convergence, curve MSE is ~1e-4 and per-token
-# CoT cross-entropy is ~3, so the principled "balanced gradients" weighting
-# is alpha = curve_MSE / CE = 3e-5. The previous V3 setting (alpha=0.1 with
-# log-hazard MSE) was equivalent to ~1e-5 in plain-MSE units. We pick 3e-5
-# as the literature-grounded default; an empirical 60-step 2-GPU sweep over
-# {1e-4, 1e-3, 1e-2} did not distinguish them on held-out IBS, so we rely
-# on the analytical balance rather than the noisy sweep.
+# Alpha rationale (REVISED post-leak):
+#
+# When the head is initialized from V7 ckpt (a CONVERGED point on the leak
+# path), curve MSE is small (~1e-4) and the principled balance is
+# alpha ~3e-5. But that was the wrong setting because we're no longer
+# starting from a converged head.
+#
+# With base Qwen2.5-Omni-3B init, the retention head is RANDOM. Initial
+# curve MSE will be ~0.1 (random predictions). The CoT CE term (~3 per
+# token) needs to be comparable to curve MSE to actually drive LM head
+# learning. alpha=1e-3 gives CoT contribution ~3e-3 vs curve ~0.1 (~3% of
+# loss), small enough to let the head converge but large enough that the
+# LM head learns CoT generation in parallel.
 ENV:
   RETENTION_HEAD_TYPE: hazard
-  RETENTION_COT_ALPHA: '3e-5'
+  RETENTION_COT_ALPHA: '1e-3'
 
 # CoT-distilled dataset (merged with the no-CoT base via build_v8_train_jsonl.py).
 # Each row carries R (per-second retention) and an assistant span wrapping
@@ -42,7 +58,10 @@ ENV:
 dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot.jsonl
 val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
 eval_strategy: steps
-max_length: 32768
+# max_length=49152 eliminates the ~18% drop rate observed at 32768
+# (long ads exceed 33k–45k tokens; capping at 49152 gives 0 skips on 300-ad sample).
+# Verify GPU memory headroom holds with this bump on the target H100 box before launch.
+max_length: 49152
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
@@ -64,12 +83,13 @@ vit_gradient_checkpointing: true
 torch_compile: false                          # head is too small to amortize compile
 deepspeed: zero3
 
-# 5 epochs since we start from a converged hazard checkpoint; the LM head
-# needs to learn CoT generation while the hazard head re-adapts to reading
-# h[</cot>] instead of h[last_input_token]. Lower LR than V7's 5e-6 because
-# we're fine-tuning a converged base rather than training from scratch.
-num_train_epochs: 5
-learning_rate: 1.0e-6
+# 10 epochs because we're training from base (random retention head).
+# V7 reached its plateau at ~6 epochs from base init; expect similar.
+# learning_rate matches V7's 5e-6 (the well-tested setting for full FT
+# from base on this task). Lower (1e-6) was for warm-start continuation
+# from a converged ckpt; that plan was abandoned after the V7 leak finding.
+num_train_epochs: 10
+learning_rate: 5.0e-6
 warmup_ratio: 0.03
 max_grad_norm: 1.0
 per_device_train_batch_size: 1
