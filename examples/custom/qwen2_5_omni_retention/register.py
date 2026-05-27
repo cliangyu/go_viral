@@ -156,7 +156,8 @@ class _HiddenStateHolder:
       Our pre_hook is registered at model-load time (before swift's),
       so PyTorch fires it first and we get the pre-conversion value.
     """
-    __slots__ = ('last', 'input_ids', 'r_true', 'r_mask', 'r_pred')
+    __slots__ = ('last', 'input_ids', 'r_true', 'r_mask', 'r_pred',
+                 'loss_curve', 'loss_cot', 'cot_alpha')
 
     def __init__(self):
         self.last = None
@@ -164,6 +165,9 @@ class _HiddenStateHolder:
         self.r_true = None
         self.r_mask = None
         self.r_pred = None
+        self.loss_curve = None
+        self.loss_cot = None
+        self.cot_alpha = None
 
 
 def _make_lm_head_capture_hook(holder: '_HiddenStateHolder'):
@@ -624,6 +628,7 @@ class RetentionLoss(BaseLoss):
         loss_curve = _masked_mse(r_pred, r_true, r_mask)
 
         alpha = float(get_env_args('RETENTION_COT_ALPHA', str, '0.0'))
+        loss_cot = None
         if alpha > 0 and labels is not None and getattr(outputs, 'logits', None) is not None:
             logits = outputs.logits
             loss_cot = F.cross_entropy(
@@ -631,8 +636,32 @@ class RetentionLoss(BaseLoss):
                 labels.view(-1),
                 ignore_index=-100,
             )
-            return loss_curve + alpha * loss_cot
-        return loss_curve
+            total = loss_curve + alpha * loss_cot
+        else:
+            total = loss_curve
+        # Stash component losses for the trainer to log. Reading by callbacks/
+        # _maybe_log_save_evaluate keyed by `outputs.loss_curve` / `outputs.loss_cot`.
+        try:
+            object.__setattr__(outputs, 'loss_curve', loss_curve.detach())
+            if loss_cot is not None:
+                object.__setattr__(outputs, 'loss_cot', loss_cot.detach())
+                object.__setattr__(outputs, 'cot_alpha', alpha)
+        except (AttributeError, TypeError):
+            # Some output container types reject attribute setting; skip silently.
+            pass
+        # Also stash on the model holder as a robust fallback (Output objects
+        # are sometimes discarded by DDP/DeepSpeed wrappers before logging).
+        if trainer is not None:
+            unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+            base = getattr(unwrapped, 'base_model', unwrapped)
+            base = getattr(base, 'model', base)
+            holder = getattr(base, '_retention_h_holder', None)
+            if holder is not None:
+                holder.loss_curve = float(loss_curve.detach().item())
+                if loss_cot is not None:
+                    holder.loss_cot = float(loss_cot.detach().item())
+                    holder.cot_alpha = float(alpha)
+        return total
 
 
 loss_map['retention_loss'] = RetentionLoss

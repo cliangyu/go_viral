@@ -397,6 +397,44 @@ class SwiftMixin:
             if getattr(self.model, 'origin_generation_config', None):
                 self.model.origin_generation_config.save_pretrained(output_dir)
 
+            # Vendor patch: post-save completeness hook for multimodal models.
+            #
+            # Multimodal processors (e.g. Qwen2.5-Omni) silently strip the
+            # tokenizer's special-token registry (added_tokens.json, vocab.json,
+            # merges.txt, special_tokens_map.json, chat_template.json,
+            # tokenizer_config.json with `added_tokens_decoder`) during
+            # `processor.save_pretrained()` because the trainer's
+            # `processing_class` attribute is the tokenizer alone, not the full
+            # processor. The saved tokenizer is missing the multimodal
+            # placeholder tokens (`<|IMAGE|>`, `<|VIDEO|>`, `<|AUDIO|>`), causing
+            # downstream `from_pretrained` to raise:
+            #     AttributeError: Qwen2TokenizerFast has no attribute image_token
+            #
+            # Mitigation: after the save, overlay any missing tokenizer files
+            # from the original base-model directory. Idempotent; copies only
+            # if a file is missing in `output_dir` but present in `model_dir`.
+            try:
+                _TOKENIZER_OVERLAY_FILES = (
+                    'added_tokens.json',
+                    'merges.txt',
+                    'special_tokens_map.json',
+                    'vocab.json',
+                    'chat_template.json',
+                    'tokenizer_config.json',
+                )
+                base_dir = self.model.model_dir
+                if base_dir and os.path.isdir(base_dir):
+                    for f in _TOKENIZER_OVERLAY_FILES:
+                        src = os.path.join(base_dir, f)
+                        dst = os.path.join(output_dir, f)
+                        if (os.path.isfile(src)
+                                and not os.path.isfile(dst)):
+                            shutil.copy(src, dst)
+            except Exception as e:
+                # Never fail a save because of the overlay; just log.
+                logger.warning(f'[tokenizer-overlay] skipped due to: '
+                               f'{type(e).__name__}: {e}')
+
     def _rotate_flash_checkpoints(self, use_mtime=False, output_dir=None) -> None:
         if (self.args.save_total_limit is None or self.args.save_total_limit <= 0):
             return

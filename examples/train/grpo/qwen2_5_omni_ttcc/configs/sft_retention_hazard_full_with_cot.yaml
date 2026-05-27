@@ -1,16 +1,19 @@
-# Variant V3-full — SFT, retention head (hazard), FULL fine-tune, WITH CoT.
-#
-# Same architecture as sft_retention_hazard_lora_with_cot.yaml but full FT.
-# This is the spec-compliant track per wanjia milestone §6.
+# SFT, retention head (hazard), FULL fine-tune, WITH CoT.
 #
 # Custom model_type qwen2_5_omni_retention with a softplus hazard head
 # reading the hidden state at the last </cot> token. R(t) = exp(-cumsum(λ))
 # is monotone non-increasing by construction.
 #
-# Joint loss L = log-hazard MSE + RETENTION_COT_ALPHA * LM cross-entropy on
-# the CoT span.
+# Joint loss:
+#   L = masked_MSE(R_pred, R_true) + RETENTION_COT_ALPHA * LM_CE(assistant_tokens)
+#
+# Continuation training from a converged hazard-only SFT checkpoint
+# (path under `model:` below). Initialization from the base
+# Qwen/Qwen2.5-Omni-3B is also valid but the head starts fresh.
 
-model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+# Default to V7's final saved checkpoint; override at CLI if continuing
+# from a different intermediate ckpt.
+model: /opt/dlami/nvme/ckpts/checkpoint-3675
 torch_dtype: bfloat16
 attn_impl: flash_attn
 
@@ -21,12 +24,24 @@ loss_type: retention_loss
 
 # Head-type and CoT loss weight are env-var-driven (read by the plugin).
 # ENV key is mandatory — see swift/cli/main.py:53.
+#
+# Alpha scale rationale: at convergence, curve MSE is ~1e-4 and per-token
+# CoT cross-entropy is ~3, so the principled "balanced gradients" weighting
+# is alpha = curve_MSE / CE = 3e-5. The previous V3 setting (alpha=0.1 with
+# log-hazard MSE) was equivalent to ~1e-5 in plain-MSE units. We pick 3e-5
+# as the literature-grounded default; an empirical 60-step 2-GPU sweep over
+# {1e-4, 1e-3, 1e-2} did not distinguish them on held-out IBS, so we rely
+# on the analytical balance rather than the noisy sweep.
 ENV:
   RETENTION_HEAD_TYPE: hazard
-  RETENTION_COT_ALPHA: '0.1'
+  RETENTION_COT_ALPHA: '3e-5'
 
-# CoT-distilled dataset; rows carry R or R_true (plugin accepts either).
-dataset: /home/ssm-user/work/data/ttcc_swift_v2cot/ttcc_train_sft.under60s.jsonl
+# CoT-distilled dataset (merged with the no-CoT base via build_v8_train_jsonl.py).
+# Each row carries R (per-second retention) and an assistant span wrapping
+# `<cot>...</cot>` with the Gemini-distilled reasoning.
+dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot.jsonl
+val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
+eval_strategy: steps
 max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
@@ -49,16 +64,20 @@ vit_gradient_checkpointing: true
 torch_compile: false                          # head is too small to amortize compile
 deepspeed: zero3
 
-num_train_epochs: 10
-learning_rate: 5.0e-6                         # full-FT range (matches H2)
-warmup_ratio: 0.05
+# 5 epochs since we start from a converged hazard checkpoint; the LM head
+# needs to learn CoT generation while the hazard head re-adapts to reading
+# h[</cot>] instead of h[last_input_token]. Lower LR than V7's 5e-6 because
+# we're fine-tuning a converged base rather than training from scratch.
+num_train_epochs: 5
+learning_rate: 1.0e-6
+warmup_ratio: 0.03
 max_grad_norm: 1.0
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
 
 logging_steps: 1
 eval_steps: 50
-save_steps: 50
+save_steps: 75
 save_total_limit: 10
 report_to: [tensorboard, wandb]
 output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot

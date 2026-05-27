@@ -76,6 +76,96 @@ def per_ad_ibs(R_pred: np.ndarray, R_true: np.ndarray, T_i: int) -> float:
     return float(((pred - true) ** 2).mean())
 
 
+def _generate_cot_then_forward(model, processor, template, row, *,
+                               max_new_tokens=600, bypass=False):
+    """Autoregressive CoT generation followed by a single forward pass that
+    triggers the retention head via the LM head pre-hook.
+
+    Returns (r_pred_tensor, generated_cot_str_or_None).
+
+    Two modes:
+      bypass=False: generate <cot>...</cot> autoregressively (stop on </cot>),
+        then run a single forward on (prompt + generated_cot) and read h[</cot>].
+      bypass=True: skip generation entirely; insert "<cot></cot>" so the head
+        anchors on the immediate </cot> with no intervening reasoning. Used as
+        the CoT-bypass diagnostic (paired with bypass=False to compute ΔIBS).
+    """
+    import torch
+    from swift.template.template_inputs import TemplateInputs
+
+    # Encode the prompt-only side. Override the assistant span with a
+    # generation-time prefix so the model continues from `<cot>`.
+    row_for_gen = dict(row)
+    row_for_gen['messages'] = list(row['messages'])
+    if bypass:
+        # Empty CoT: head reads the encoder state immediately after the open tag.
+        row_for_gen['messages'][-1] = {'role': 'assistant', 'content': '<cot></cot>'}
+        ti = TemplateInputs.from_dict(row_for_gen)
+        enc = template.encode(ti)
+        batch = template.data_collator([enc])
+        batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+        with torch.no_grad():
+            out = model(**batch)
+        r_pred = getattr(out, 'r_pred', None)
+        return r_pred, ''
+
+    # bypass=False: use the chat template's normal "generation prompt" path —
+    # encode with a `<cot>` open and let model.generate continue. The trick:
+    # we set the assistant content to a literal `<cot>` so the template
+    # appends `<cot>` and stops there; then generate up to a `</cot>` stop string.
+    row_for_gen['messages'][-1] = {'role': 'assistant', 'content': '<cot>'}
+    ti = TemplateInputs.from_dict(row_for_gen)
+    enc = template.encode(ti)
+    batch = template.data_collator([enc])
+    # Move EVERYTHING to cuda for generation; HF generate handles its own
+    # device placement.
+    batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+
+    # Generate until </cot>. Greedy for reproducibility; sampling is only for
+    # V9 RL rollouts (different code path).
+    gen_kwargs = {
+        'max_new_tokens': max_new_tokens,
+        'do_sample': False,
+        'eos_token_id': processor.tokenizer.eos_token_id,
+        'pad_token_id': processor.tokenizer.pad_token_id,
+        'stop_strings': ['</cot>'],
+        'tokenizer': processor.tokenizer,
+    }
+    # Drop r_true/r_mask before generate (it's a forward-only signal).
+    gen_batch = {k: v for k, v in batch.items() if k not in ('r_true', 'r_mask')}
+    with torch.no_grad():
+        gen = model.generate(**gen_batch, **gen_kwargs)
+
+    # Decode the generated CoT body for inspection.
+    prompt_len = batch['input_ids'].shape[1]
+    new_tokens = gen[0, prompt_len:]
+    generated_cot = processor.tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+    # Run a single forward over the FULL sequence (prompt + generated) to read
+    # h[</cot>] via the retention head's pre-hook. r_true/r_mask must be
+    # absent at this stage (no MSE target during inference); the head still
+    # populates r_pred on outputs.
+    full_ids = gen
+    forward_inputs = dict(batch)
+    forward_inputs['input_ids'] = full_ids
+    # Adjust attention_mask if present.
+    if 'attention_mask' in forward_inputs:
+        forward_inputs['attention_mask'] = torch.ones_like(full_ids)
+    # Drop r_true/r_mask (don't compute training loss here).
+    forward_inputs.pop('r_true', None)
+    forward_inputs.pop('r_mask', None)
+    with torch.no_grad():
+        out = model(**forward_inputs)
+    r_pred = getattr(out, 'r_pred', None)
+    if r_pred is None:
+        # Fallback to holder.
+        base = getattr(model, 'base_model', model)
+        base = getattr(base, 'model', base)
+        holder = getattr(base, '_retention_h_holder', None)
+        r_pred = holder.r_pred if holder is not None else None
+    return r_pred, generated_cot
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
@@ -83,9 +173,32 @@ def main():
     ap.add_argument('--limit', type=int, default=20)
     ap.add_argument('--plugin', required=True)
     ap.add_argument('--head-type', default='hazard', choices=['hazard', 'sigmoid'])
-    ap.add_argument('--max-length', type=int, default=24576)
+    ap.add_argument('--max-length', type=int, default=32768,
+                    help='Sequence length cap. Defaults to 32768 to match the V7+ training '
+                         'config; reduces eval drop rate ~12.5%% (at 24576) -> ~5%% (at 32768) '
+                         'on the long-ad tail (per 40-ad token-distribution measurement).')
     ap.add_argument('--output', type=Path, default=None,
                     help='Optional: write per-ad results + summary as JSON (parent dirs auto-created).')
+    ap.add_argument('--dump-curves', action='store_true',
+                    help='Include per-ad R_pred and R_true arrays in the output JSON '
+                         '(enables pure-render plotting + drop-localization analysis).')
+    ap.add_argument('--generate-cot', action='store_true',
+                    help='Autoregressively generate <cot>...</cot> before reading the '
+                         'retention head. Required for V8+ CoT-trained models where the '
+                         'head anchors on the last </cot> token of the MODEL OUTPUT, not '
+                         'on a teacher-forced CoT. Off by default; default path is single-forward '
+                         'teacher-forced eval matching V7. Slower per ad (~4x) since it does '
+                         '1 generate + 1 forward instead of 1 forward.')
+    ap.add_argument('--cot-max-new-tokens', type=int, default=600,
+                    help='Cap on autoregressively generated CoT tokens (only when '
+                         '--generate-cot is set). Median CoT in our training data is ~280 '
+                         'tokens; 600 is comfortable headroom.')
+    ap.add_argument('--cot-bypass', action='store_true',
+                    help='Diagnostic: skip CoT generation; insert immediate `</cot>` to '
+                         'force the head to read the encoder state without reasoning. '
+                         'Use with --generate-cot to compare ΔIBS = bypass IBS - full IBS. '
+                         'If ΔIBS ≈ 0, the CoT is decorative; if positive, CoT is doing work. '
+                         'The proposal central diagnostic of the reasoning thesis.')
     args = ap.parse_args()
 
     # 1. Import plugin to register model_type / template / loss.
@@ -180,22 +293,34 @@ def main():
             continue
 
         # Move tensors to GPU and forward
+        generated_cot = None
         try:
-            batch = template.data_collator([enc])
-            batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-            with torch.no_grad():
-                out = model(**batch)
-                r_pred = getattr(out, 'r_pred', None)
-                if r_pred is None:
-                    holder = getattr(model, '_retention_h_holder', None)
-                    r_pred = holder.r_pred if holder is not None else None
-                if r_pred is None:
-                    print(f'[eval] ad {i:3d}: r_pred MISSING')
-                    skipped += 1
-                    continue
-                # r_pred is (1, 60); take first :T_i+1, force R(0)=1
-                R_pred = r_pred[0].float().cpu().numpy()
-                R_pred_full = np.concatenate([[1.0], R_pred])[: T_i + 1]
+            if args.generate_cot:
+                # V8+ path: autoregressively generate <cot>...</cot> then read the
+                # retention head from the </cot> anchor in a final forward.
+                r_pred, generated_cot = _generate_cot_then_forward(
+                    model, processor, template, row,
+                    max_new_tokens=args.cot_max_new_tokens,
+                    bypass=args.cot_bypass,
+                )
+            else:
+                # V7 path: single-forward teacher-forced eval.
+                batch = template.data_collator([enc])
+                batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v)
+                         for k, v in batch.items()}
+                with torch.no_grad():
+                    out = model(**batch)
+                    r_pred = getattr(out, 'r_pred', None)
+                    if r_pred is None:
+                        holder = getattr(model, '_retention_h_holder', None)
+                        r_pred = holder.r_pred if holder is not None else None
+            if r_pred is None:
+                print(f'[eval] ad {i:3d}: r_pred MISSING')
+                skipped += 1
+                continue
+            # r_pred is (1, 60); take first :T_i+1, force R(0)=1
+            R_pred = r_pred[0].float().cpu().numpy()
+            R_pred_full = np.concatenate([[1.0], R_pred])[: T_i + 1]
         except Exception as e:
             print(f'[eval] ad {i:3d}: skip (forward {type(e).__name__}: {str(e)[:80]})')
             skipped += 1
@@ -205,8 +330,14 @@ def main():
         ibs_b1 = per_ad_ibs(B1_curve[: T_i + 1], R_true, T_i)
         model_ibs.append(ibs_model)
         b1_ibs.append(ibs_b1)
-        ad_records.append({'idx': i, 'ad_id': row.get('ad_id'), 'T': T_i,
-                           'ibs_model': ibs_model, 'ibs_b1': ibs_b1})
+        record = {'idx': i, 'ad_id': row.get('ad_id'), 'T': T_i,
+                  'ibs_model': ibs_model, 'ibs_b1': ibs_b1}
+        if args.dump_curves:
+            record['R_pred'] = R_pred_full[: T_i + 1].astype(float).tolist()
+            record['R_true'] = R_true[: T_i + 1].astype(float).tolist()
+        if generated_cot is not None:
+            record['generated_cot'] = generated_cot
+        ad_records.append(record)
         print(f'[eval] ad {i:3d} (T={T_i:2d}): IBS_model={ibs_model:.5f}  IBS_B1={ibs_b1:.5f}  Δ={ibs_model - ibs_b1:+.5f}')
 
     print()
@@ -229,7 +360,13 @@ def main():
             'val_jsonl': args.val_jsonl,
             'head_type': args.head_type,
             'limit': args.limit,
+            'max_length': args.max_length,
+            'dump_curves': bool(args.dump_curves),
+            'generate_cot': bool(args.generate_cot),
+            'cot_bypass': bool(args.cot_bypass),
         }
+        if args.dump_curves:
+            summary['B1_curve'] = B1_curve.astype(float).tolist()
         args.output.write_text(json.dumps({'summary': summary, 'per_ad': ad_records}, indent=2))
         print(f'[eval] wrote {args.output}')
 
