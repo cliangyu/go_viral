@@ -302,7 +302,6 @@ def train():
         "--dataset", str(train_jsonl),
         "--val_dataset", str(val_jsonl),
         "--output_dir", str(out_dir),
-        "--save_only_model", "false",                       # need optimizer state for resume
     ]
     if latest_ckpt:
         cmd += ["--resume_from_checkpoint", latest_ckpt]
@@ -310,9 +309,32 @@ def train():
     else:
         print("Fresh start from base Qwen2.5-Omni-3B")
 
+    # --- Stage 4: start the HF-upload watcher in parallel. ---
+    # Each new checkpoint-<step>/ dir gets pushed to HF as it's written.
+    # The watcher is idempotent (marks uploaded with a sentinel file) so
+    # surviving multiple container retries is safe.
+    upload_proc = subprocess.Popen([
+        "python",
+        "/opt/go_viral/examples/train/grpo/qwen2_5_omni_ttcc/watch_and_upload_ckpts.py",
+        "--output-dir", str(out_dir),
+        "--hf-repo",    "liangyuch/ttcc-sft-qwen25omni-3b-v8-cot-modal",  # change as desired
+        "--poll-sec",   "60",
+    ], stdout=open("/vol/output/upload.log", "a"), stderr=subprocess.STDOUT)
+
     env = {**os.environ, "NPROC_PER_NODE": "8"}
-    subprocess.run(cmd, env=env, check=True, cwd="/opt/go_viral")
-    vol.commit()
+    try:
+        subprocess.run(cmd, env=env, check=True, cwd="/opt/go_viral")
+    finally:
+        # Give the watcher 5 minutes to drain pending uploads, then kill.
+        # The next retry's watcher will pick up anything left.
+        import time
+        time.sleep(300)
+        upload_proc.terminate()
+        try:
+            upload_proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            upload_proc.kill()
+        vol.commit()
 
 @app.local_entrypoint()
 def main():
@@ -328,19 +350,90 @@ The retries policy means you can detach after launching — Modal will
 auto-relaunch up to 10 times across the 24h boundary. Total wall-clock
 ceiling: ~240h, more than enough headroom for a 50h run.
 
-## Pre-launch sanity (inside container, one-shot)
+## Pre-launch sanity — run on a cheap L4 before reserving 8×H100
 
-Same script as the AWS path:
-```bash
-bash /opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/validate_v8_launch.sh \
-    /vol/hf-cache/Qwen2.5-Omni-3B \
-    /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl \
-    /vol/data/ttcc_v8/val_200_no_cot.jsonl
-# Exits 0 = safe to launch. Exits 1 = stop and debug.
+Don't pay $32/hr to find out your data layout is broken. Add this function
+to `train_v8.py` and run it once before launching:
+
+```python
+@app.function(
+    image=image,
+    gpu="L4",                                       # $0.80/hr
+    timeout=1800,
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("hf-token")],
+)
+def preflight():
+    os.environ["HF_HOME"] = "/vol/hf-cache"
+    # Ensure the validate script + data + model are present.
+    subprocess.run([
+        "bash",
+        "/opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/validate_v8_launch.sh",
+        "/vol/hf-cache/Qwen2.5-Omni-3B",
+        "/vol/data/ttcc_v8/ttcc_train_with_cot.jsonl",
+        "/vol/data/ttcc_v8/val_200_no_cot.jsonl",
+    ], check=True)
+    # Also spot-check the leak-free invariants on 50 random rows.
+    subprocess.run([
+        "python", "-c",
+        # (same 50-row leak invariants check as the AWS runbook step 5)
+        "import json,random; rows=open('/vol/data/ttcc_v8/ttcc_train_with_cot.jsonl').read().splitlines();"
+        "random.seed(0); sample=random.sample(rows, min(50,len(rows)));"
+        "n=0\nfor i,line in enumerate(sample):"
+        "  d=json.loads(line); a=d['messages'][-1]['content']; R=d['R'];"
+        "  assert a.strip().startswith('<cot>') and a.strip().endswith('</cot>'), f'row {i}: assistant span malformed';"
+        "  [(_ for _ in ()).throw(AssertionError(f'row {i}: R={r:.4f} leaked')) for r in R[1:] for dp in (2,3,4) if f'{r:.{dp}f}' in a];"
+        "  assert d['videos'][0]==d['audios'][0]; assert abs(R[0]-1.0)<1e-6 and len(R)==d['T']+1;"
+        "  assert all(R[k+1]<=R[k]+1e-6 for k in range(len(R)-1));"
+        "  n+=1\nprint(f'{n} rows OK')",
+    ], check=True)
+    print("preflight: PASS")
 ```
 
-You can run this as a small `@app.function(gpu="L4")` before committing to
-the 8×H100 reservation — pre-validates data + model load without burning $32/hr.
+Run:
+```bash
+modal run train_v8.py::preflight
+```
+
+Exits 0 = safe to launch. Exits non-zero = STOP and debug.
+
+## First-checkpoint sanity (V7 post-mortem check)
+
+After step 75 saves, run the randomization probe BEFORE letting the run go
+for 50h. This is the V7 incident's primary learning: V7 trained to ~0
+loss while completely ignoring video. The probe perturbs the video tensor
+and checks that predictions change materially.
+
+```python
+@app.function(
+    image=image,
+    gpu="H100:1",                                    # 1 GPU is enough for forward-only
+    timeout=3600,
+    volumes={"/vol": vol},
+)
+def probe(checkpoint_step: int = 75, n_ads: int = 20):
+    import glob
+    pattern = f"/vol/output/sft_retention_hazard_full_with_cot/v*-*/checkpoint-{checkpoint_step}"
+    matches = sorted(glob.glob(pattern))
+    assert matches, f"no checkpoint at step {checkpoint_step}"
+    ckpt = matches[-1]
+    subprocess.run([
+        "python",
+        "/opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/randomization_probe.py",
+        "--ckpt", ckpt,
+        "--val-jsonl", "/vol/data/ttcc_v8/val_200_no_cot.jsonl",
+        "--n-ads", str(n_ads),
+    ], check=True)
+```
+
+Run from your laptop once step 75 lands (watch wandb for the save event):
+```bash
+modal run train_v8.py::probe
+# Exits 0 = PASS (model uses video). Exits 1 = FAIL → kill training, escalate.
+```
+
+If FAIL: the V8 architecture has the same blind-to-video problem as V7.
+Don't burn 45 more hours. Kill with `modal app stop ttcc-v8` and escalate.
 
 ## During training — what to watch
 
