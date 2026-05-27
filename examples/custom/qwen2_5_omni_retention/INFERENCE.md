@@ -1,5 +1,19 @@
 # Inference Guide — Retention-Curve Predictor (Qwen2.5-Omni-3B + hazard head)
 
+> **⚠ IMPORTANT (2026-05-26): V7 checkpoints under `v2-20260524-103930/checkpoint-*`
+> were trained with a label-in-input leak. Three independent audits (randomization
+> probe, video-swap, constant-predictor sanity) confirm the V7 backbone does NOT
+> use the video signal — predictions are essentially constant per ad once the
+> leaked ground-truth curve is removed from the input. Do NOT use V7 checkpoints
+> for new inference. They are kept on HF for reproducibility / audit only.
+>
+> A leak-free V8 (with CoT distillation, assistant span = `<cot>...</cot>` only)
+> is in preparation. This guide will be updated when V8 checkpoints land.
+>
+> See `INCIDENT_2026-05-26_EVAL_LEAK.md` in
+> [cliangyu/ttcc-eval](https://github.com/cliangyu/ttcc-eval) for the full
+> three-part incident review and the affected metrics.
+
 This guide shows how to load a trained TTCC retention checkpoint and predict the per-second retention curve `R(t)` for a TikTok ad video. Single forward pass per ad; works on a single 24 GB+ GPU.
 
 ## What the model does
