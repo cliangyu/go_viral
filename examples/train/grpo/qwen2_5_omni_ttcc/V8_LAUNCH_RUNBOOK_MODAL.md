@@ -170,26 +170,47 @@ Config recap (do not change):
 - `RETENTION_HEAD_TYPE=hazard`, `RETENTION_COT_ALPHA=1e-3`
 - `save_steps: 75`, `save_total_limit: 10`
 
-## Modal app skeleton
+## Dependencies — build the Modal image correctly
+
+The AWS path uses `pip install -e .` inside a cloned `go_viral` repo, which
+installs all of ms-swift's `requirements/framework.txt`. Same idea on Modal.
+Two gotchas:
+
+1. **flash-attn must be installed AFTER torch** with `--no-build-isolation`,
+   matching the CUDA + torch ABI. Doing it in a single `pip_install` call
+   silently picks the wrong wheel.
+2. **CUDA base image** — use Modal's `from_registry("nvidia/cuda:...")` or
+   `modal.Image.from_registry("pytorch/pytorch:...")` so the right CUDA libs
+   are present. `debian_slim` does NOT have CUDA.
 
 ```python
-# train_v8.py
-import modal
-import subprocess
-import os
-from pathlib import Path
-
-app = modal.App("ttcc-v8")
-
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "ffmpeg", "libgl1")
-    .pip_install("torch==2.4.0", "transformers", "deepspeed==0.15.2",
-                 "flash-attn==2.8.3", "huggingface_hub", "wandb",
-                 "tensorboard", "qwen-omni-utils")
+    # Pytorch 2.4 + CUDA 12.4 base — matches the wheel flash-attn 2.8.3 expects
+    modal.Image.from_registry(
+        "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel",
+        add_python="3.11",
+    )
+    .apt_install("git", "ffmpeg", "libgl1", "build-essential", "ninja-build")
+    # flash-attn first, with --no-build-isolation so it sees torch
+    .pip_install(
+        "flash-attn==2.8.3",
+        extra_options="--no-build-isolation",
+    )
+    # Everything else
+    .pip_install(
+        "deepspeed==0.15.2",
+        "huggingface_hub[hf_transfer]",            # parallel HF downloads
+        "wandb",
+        "qwen-omni-utils",
+        "av",                                       # video decoding for Qwen-Omni
+    )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    # Clone ttcc-rl branch + install ms-swift in editable mode.
+    # This pulls in the rest (transformers, accelerate, peft, datasets, etc.)
+    # from requirements/framework.txt.
     .run_commands(
         "git clone -b ttcc-rl https://github.com/cliangyu/go_viral.git /opt/go_viral",
-        "cd /opt/go_viral && pip install -e .",
+        "cd /opt/go_viral && pip install -e '.[all]'",
     )
 )
 
@@ -340,24 +361,50 @@ left off.
 3. Skip uploading `global_step*` DeepSpeed shards — they're only needed for
    resume, not inference, and they double the upload size.
 
-## Fallback: if Leon hasn't uploaded the V8 jsonl yet
+## Data sourcing — important caveat
 
-Rebuild it from V7 jsonl + CoT jsonl. Both need to be reachable — easiest is
-for Leon to upload them as a private dataset first; otherwise via temporary
-S3 → HF mirror:
+There are **two** scripts in the repo and only one is leak-free for V8:
 
-```bash
-huggingface-cli download liangyuch/<v7-data-repo> \
-    --repo-type dataset --local-dir /tmp/v7_data
-huggingface-cli download liangyuch/<cot-data-repo> \
-    --repo-type dataset --local-dir /tmp/cot_data
+| Script | Status | What it does |
+|---|---|---|
+| `scripts/data/build_ttcc_jsonl.py` | ⚠ **V7-LEAKY** as committed | Builds an SFT JSONL where assistant span = `<cot>(reasoning here)</cot>\n{"R": [...]}` — embeds R(t) in the answer, which is exactly the leak V8 fixes |
+| `examples/custom/qwen2_5_omni_retention/tools/build_v8_train_jsonl.py` | ✅ Leak-free | Merges V7 jsonl (R + video paths) with CoT jsonl (Gemini distillation), produces assistant span = `<cot>...</cot>` only. **But this script lived only on the dead 8-GPU box's NVMe — it's NOT in the repo yet.** |
 
-python /opt/go_viral/examples/custom/qwen2_5_omni_retention/tools/build_v8_train_jsonl.py \
-    --v7-jsonl /tmp/v7_data/ttcc_train_sft.jsonl \
-    --cot-jsonl /tmp/cot_data/cot_v6_train.jsonl \
-    --out-jsonl /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl
-wc -l /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl     # should be 39375
+So: **Wanjia cannot rebuild V8 jsonl from scratch on Modal.** The leak-free
+builder isn't in the repo, and `build_ttcc_jsonl.py` in its current form
+would reintroduce the V7 leak.
+
+**The only safe path is: Leon uploads the pre-built `ttcc_train_with_cot.jsonl`
++ `val_200_no_cot.jsonl` to HF as a private dataset.** Wanjia then pulls
+them directly:
+
+```python
+# Inside the Modal function:
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="liangyuch/ttcc-v8-train",          # <-- Leon will tell you exact name
+    repo_type="dataset",
+    local_dir="/vol/data/ttcc_v8",
+    allow_patterns=["*.jsonl"],
+)
 ```
+
+Then re-path the video field from each jsonl row (the AWS box paths
+`/home/ssm-user/...` won't resolve on Modal):
+
+```python
+import json
+from pathlib import Path
+jsonl = Path("/vol/data/ttcc_v8/ttcc_train_with_cot.jsonl")
+rows = [json.loads(l) for l in jsonl.read_text().splitlines()]
+for r in rows:
+    ad_id = r["ad_id"]
+    r["videos"] = [f"/vol/data/videos/{ad_id}.mp4"]
+    r["audios"] = [f"/vol/data/videos/{ad_id}.mp4"]
+jsonl.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+```
+
+Or pre-rewrite the jsonl on Leon's side before upload — even better. Either way, video paths must be Modal-resolvable.
 
 ## Failure modes
 
