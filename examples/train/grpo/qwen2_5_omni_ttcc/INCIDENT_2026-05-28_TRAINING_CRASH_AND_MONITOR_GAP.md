@@ -1,47 +1,65 @@
-# Incident Review: V8 Training Crash + 9 h 20 m Monitor Blackout (2026-05-28)
+# Incident Review: V8 Training Killed by Co-tenant Cleanup + 9 h 20 m Monitor Blackout (2026-05-28)
+
+> **REVISED 2026-05-28 17:30 UTC** after obtaining root access via
+> `aws ssm send-command` and reading the SSM agent log. The initial revision
+> hypothesized "SSM session timeout" — that hypothesis was WRONG. Actual root
+> cause is documented below in Part 2.
 
 ## Part 1 — What happened
 
+**Background:** This is a shared-tenancy AWS Capacity Block instance.
+Multiple people (at least Leon, Claude/me, and Zuocan) have access to the
+`gpu-box` AWS profile and can issue commands as root via `aws ssm
+send-command`. There was no documented coordination protocol for who could
+run cleanup utilities when.
+
 **Timeline (UTC, 2026-05-28):**
 
-- **06:03**: Launcher script `launch_training_2node.sh` finalized on head node
-  with sed edits (FA3, USE_AUDIO_IN_VIDEO=false, NCCL heartbeat). Invocation
-  pattern: `bash sft.sh CONFIG 2>&1 | tee /opt/dlami/nvme/logs/v8_distributed.log`
-  — no `nohup`, no `setsid`, no `disown`, no tmux, no screen.
-
-- **06:20:11**: Training launched. wandb run `fxryqedt` started. All 16 ranks
-  on both nodes initialize, ZeRO-3 shards, model loaded.
-
+- **02:09:26**: First `pkill -9 -f launch_training_2node` event of the day,
+  issued via `aws ssm send-command` using Leon's IAM credentials. (Not us;
+  we weren't running anything at this point.)
+- **04:02**: `/opt/dlami/nvme/ckpt-s3-watcher.sh` written to the box
+  (Zuocan's checkpoint-backup automation).
+- **05:42:41, 05:48:11, 05:50:28**: Three more `pkill -9 -f 'swift sft'` +
+  `pkill -9 -f launch_training_2node` events, also via SendCommand.
+- **05:48:11**: `/opt/dlami/nvme/gpu-clean.sh` **birth time** (file first
+  created). This is the polished cleanup script that gets re-pushed and
+  re-executed on every subsequent cleanup.
+- **06:03**: Our launcher script `launch_training_2node.sh` finalized on
+  head node with sed edits (FA3, USE_AUDIO_IN_VIDEO=false, NCCL heartbeat).
+  Invocation pattern: `bash sft.sh CONFIG 2>&1 | tee log` — no `nohup`,
+  no `setsid`, no `disown`, no tmux, no screen.
+- **06:20:11**: Our V8 training launched. wandb run `fxryqedt` started. All
+  16 ranks on both nodes initialize, ZeRO-3 shards, model loaded.
 - **06:54** (step 8): 16-check integrity audit passed. `V8_INTEGRITY_AUDIT.md`
   committed and pushed. Run state: loss=30.13, grad_norm=3994 (clipped),
   memory=54 GB peak per GPU.
-
-- **07:14:27**: My local babysitter (`/tmp/v8_babysit.sh`) ran its first
-  poll iteration. The regex
-  `grep -E "Killed|nan|inf.*loss|OOM|SIGKILL"` was applied to
-  `$OUT` — which contained the SSM session's stdout INCLUDING the echoed
-  command line. The echoed command itself contained the literal strings
-  `Killed`, `nan`, `inf`, `OOM`, `SIGKILL` (as part of the grep arguments
-  themselves). The regex matched on its OWN command echo. The babysitter
-  printed `!!! ALERT: failure signal in log:` and hit `break` to exit the
-  loop. **Babysitter dead after one (false) iteration. Total monitoring
-  time: 0 minutes.**
-
-- **07:19:46** (step 15): Loss dropping fast (35.5 → 8.16 across steps 6–15
-  as the head learned the curve scale). grad_norm 2111 (smaller than earlier
-  4000s — head bias correction was paying off). Memory still 54 GB. **The run
-  was actually getting healthy.**
-
-- **07:23:36**: Training crashed. Ranks 0–4 received SIGKILL (exit -9),
-  ranks 5–7 received SIGTERM (exit -15) one second later (07:23:37). torchrun
-  parent (PID 398525) died with `Killed`. All 8 GPUs on head node went to
-  0 MiB / 0% util.
-
-- **07:23:36 → 16:44** (9 h 20 m): **Dead air.** No process running. No
-  monitor watching. wandb run paused. CB clock burning. I (Claude) was idle
-  with no notification path. Leon was asleep, trusted that I would notify.
-
-- **16:44**: Leon awoke, asked "crashed? didn't monitor? you screwed".
+- **07:14:27**: My local "babysitter" (`/tmp/v8_babysit.sh`) ran its first
+  poll iteration. The regex `Killed|nan|inf.*loss|OOM|SIGKILL` was applied
+  to `$OUT` — which contained the SSM session's stdout INCLUDING the echoed
+  command. The echoed command itself contained the literal strings
+  `Killed`, `nan`, `OOM`, `SIGKILL`. The regex matched on its OWN command
+  echo. False-positive alert, `break` statement exited the loop.
+  **Babysitter dead after 0 minutes of real monitoring.**
+- **07:19:46** (step 15): Loss dropping fast (35.5 → 8.16 across steps 6-15).
+  grad_norm 2111 (head bias correction paying off). Memory stable at 54 GB.
+  The run was genuinely getting healthy.
+- **07:23:36**: SSM agent on head node received an `aws ssm send-command`
+  invocation (orchestration UUID `9ffbdb87-91c3-4061-96a2-0ff0e37d71a6`).
+  The command body was:
+  ```bash
+  echo <base64-of-gpu-clean.sh> | base64 -d > /opt/dlami/nvme/gpu-clean.sh
+  bash /opt/dlami/nvme/gpu-clean.sh
+  ```
+  `gpu-clean.sh` then ran (decoded in Part 2). It ran `nvidia-smi
+  --query-compute-apps=pid`, found PIDs 398821-398828 (our 8 training ranks
+  on head node), and `sudo kill -9` each. Plus belt-and-suspenders
+  `pkill -9 -f 'swift sft'`, `pkill -9 -f torch.distributed.run`,
+  `pkill -9 -f sft.py`, `pkill -9 -f launch_training_2node`.
+- **07:23:36 → 16:44** (9 h 20 m): **Dead air.** No training process, no
+  monitor, no notification. wandb run paused. CB clock burning. Leon asleep,
+  trusted me to notify.
+- **16:44**: Leon woke up, asked "crashed? didn't monitor? you screwed".
   Discovery moment.
 
 **Net cost:**
@@ -53,78 +71,96 @@
 | Steps not completed during blackout (at 246 s/step) | **~136 steps** = ~½ epoch |
 | % of CB budget burned to dead air | **~6.7 %** |
 | CB remaining at discovery | 138 h 45 m |
-| Status of step-50 eval (val curve_loss — the retention metric we care about) | Never landed |
-| Status of step-75 ckpt + randomization probe (V7-class hard test) | Never landed |
+| Step-50 val curve_loss (retention metric) | Never landed |
+| Step-75 ckpt + randomization probe (V7-class hard test) | Never landed |
 | GPU-hours wasted | 16 GPUs × 9.3 h = **~149 GPU-h** = ~$595 at p5.48xlarge rate |
 
-**No checkpoint contamination** — first save was scheduled at step 75 (crashed
-at step 15). No model state corrupted. Run state on disk = empty output dir,
+**No checkpoint contamination** — first save was scheduled at step 75
+(crashed at step 15). No model state corrupted. Run state on disk is empty,
 clean for restart.
 
 ## Part 2 — Why it happened (technical deep dive)
 
-This incident has TWO independent failure modes that intersected catastrophically.
-Either alone would have been a near-miss; together they produced a 9-hour
-blackout.
+This incident has THREE intertwined failure modes:
 
-### Failure 1: Training process killed by SSM session lifecycle
+### Failure 1: Co-tenant cleanup automation killed our training
 
-**Process tree at launch:**
+**The script** (`/opt/dlami/nvme/gpu-clean.sh`, decoded from the SendCommand
+body at 07:23:36):
+
+```bash
+#!/bin/bash
+# Thorough GPU free: kill processes by GPU-holding PID
+# (catches orphans that pkill-by-name misses).
+echo "host=$(hostname) now=$(date -u +%FT%TZ)"
+echo "--- BEFORE: GPU mem used ---"
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+
+PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sort -un)
+echo "pids: $(echo $PIDS | tr '\n' ' ')"
+for p in $PIDS; do sudo kill -9 "$p" 2>/dev/null; done
+# belt-and-suspenders by name too
+sudo pkill -9 -f 'swift sft' 2>/dev/null
+sudo pkill -9 -f 'torch.distributed.run' 2>/dev/null
+sudo pkill -9 -f 'sft.py' 2>/dev/null
+sudo pkill -9 -f 'launch_training_2node' 2>/dev/null
+sleep 10
+echo "--- AFTER: GPU mem + util (want ~0 MiB all 8) ---"
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
+echo "--- ckpt watcher alive? ---"
+pgrep -f ckpt-s3-watcher.sh | tr '\n' ' '; echo
 ```
-ssm-user's SSM shell (transient, parent)
-└── bash launch_training_2node.sh
-    └── bash sft.sh CONFIG
-        └── tee /opt/dlami/nvme/logs/v8_distributed.log
-            └── ${VENV}/bin/swift sft CONFIG  (PID 398525, master)
-                └── python -m torch.distributed.run --nproc_per_node 8 ...
-                    └── 8 × swift sft rank workers (PID 398821–398828)
-                        └── 32 × dataloader workers
-```
 
-**The kill chain:**
-1. The training launcher was invoked from a shell inside an `aws ssm
-   start-session` interactive session. There was no `nohup`, `setsid`,
-   `disown &`, tmux, or screen anywhere in the launch script. Verified by
-   grep: `nohup|tmux|screen|disown|setsid` returns 0 matches in
-   `launch_training_2node.sh`.
+**Authorship:** Not mine. The script references `ckpt-s3-watcher.sh` (S3
+checkpoint backup utility located at `/opt/dlami/nvme/ckpt-s3-watcher.sh`,
+created 04:02 UTC) which is **Zuocan's infrastructure** — I have no such
+utility in my codebase.
 
-2. SSM Session Manager has an **idle session timeout** (default 20 minutes,
-   sometimes configured higher; in this account behavior consistent with ~1 h
-   based on the 06:20 → 07:23 = 63 min interval).
+**Recurrence:** This is **not a one-off event.** Auth log shows four
+distinct invocations on the same day:
 
-3. When the SSM session terminated, its shell process died. By POSIX semantics,
-   the kernel sent `SIGHUP` to every process whose controlling terminal was
-   that shell — which was the entire descendant tree.
+| Time (UTC) | Action |
+|---|---|
+| 02:09:26 | `pkill -9 -f launch_training_2node` |
+| 05:48:11 | `pkill -9 -f 'swift sft'` + birth of `gpu-clean.sh` file |
+| 05:50:28 | `pkill -9 -f 'swift sft'` |
+| **07:23:36** | `pkill -9 -f 'swift sft'` ← **killed our V8 run** |
 
-4. The swift master (PID 398525) is a Python process with no SIGHUP handler
-   installed. SIGHUP terminated it. swift's atexit handlers fired briefly,
-   trying to send SIGTERM to all 16 ranks for orderly shutdown.
+The irregular spacing (3 hr → 5 min → 1.5 hr) rules out a cron; this is
+manual invocation. Zuocan was iterating his own runs through the morning;
+between his iteration #3 (05:50) and iteration #4 (07:23), we launched V8
+without coordinating. His iteration #4 killed us.
 
-5. The TERM-then-KILL escalation took ~1 second on 5 of the 8 head-node ranks;
-   the kernel reaped them with SIGKILL (exit -9) before TERM finished. The
-   remaining 3 ranks managed orderly SIGTERM exit (-15) one second later.
+**Authorization context:** Anyone with credentials for the `gpu-box` AWS
+profile can issue `aws ssm send-command` as root. The CloudTrail event
+shows `SessionOwner = arn:aws:iam::590184069312:user/leon` — Leon's IAM
+user — but those credentials are presumably shared between Leon, Zuocan,
+and possibly others. We cannot distinguish individual humans from the
+audit log; we can only say "someone with Leon's credentials, who has
+Zuocan's automation scripts on disk." Inference: Zuocan.
 
-**Evidence supporting this theory:**
-- `dmesg` clean (no OOM-killer activity → not memory pressure)
-- Host RAM: 159 GB used / 2 TB → not RAM pressure
-- GPU memory stable at 54 GB across 15 steps → not GPU OOM
-- The "ranks 0–4 SIGKILL, ranks 5–7 SIGTERM" pattern is exactly the signature
-  of a kernel-reap-after-graceful-shutdown-timeout
-- The 63-min interval matches typical SSM idle timeout windows
-- `ssm-user` doesn't have `journalctl -u amazon-ssm-agent` permissions to
-  confirm, but the elimination of all other plausible causes (OOM, NaN, GPU
-  fault, manual kill) leaves SSM timeout as the dominant hypothesis
+**Why detached launcher (setsid nohup) does NOT solve this:** The kill
+was a direct `kill -9 <pid>` enumerated from `nvidia-smi
+--query-compute-apps=pid`. There is no shell ancestor to detach from; the
+kernel's PID lookup finds the rank workers regardless of session
+membership. Detachment protects against SIGHUP from shell death; it does
+not protect against a privileged user with the PID.
 
-**Why the V7 / V8 SDPA-override / V8 audio-OOB incidents didn't expose this:**
+### Failure 2: No co-tenancy coordination protocol
 
-Those incidents all crashed the training within minutes of launch, before the
-SSM session timeout could fire. This was the **first** V8 run that survived
-past ~5 minutes — and immediately ran into the next silent infrastructure
-trap.
+The deeper failure underneath Failure 1: this is a shared-tenancy box
+without a documented "who's using the GPUs right now" protocol. Symptoms:
+- No reservation system (calendar, file lock, anything)
+- No "training in progress" marker file that cleanup scripts check
+- No team chat thread saying "I'm running V8 from 06:20 for ~7 days"
+- No protective convention like "don't pkill -9 -f swift unless it's yours"
 
-### Failure 2: Babysitter regex matched its own command echo
+**Both Zuocan and I lacked the information to coordinate.** I launched
+without telling anyone. He cleaned up without checking who was running.
 
-**The bug (`/tmp/v8_babysit.sh` line 17–18):**
+### Failure 3: My babysitter regex matched its own command echo
+
+**The bug (`/tmp/v8_babysit.sh` line 17-18):**
 ```bash
 OUT=$(... ssm_run.sh \
   "tail -200 /opt/dlami/nvme/logs/v8_train.log 2>&1 | tr -d '\r' | \
@@ -139,194 +175,193 @@ if echo "$OUT" | grep -qE "Killed|nan|inf.*loss|OOM|SIGKILL"; then
 fi
 ```
 
-**What goes wrong:**
+`ssm_run.sh` invokes `aws ssm start-session` and pipes the command into
+the session's stdin. The SSM session **echoes the command line to stdout
+before executing it.** So `$OUT` contains, near its top, a line that
+literally reads the grep command — including the words `Killed`, `nan`,
+`OOM`, `SIGKILL`. My failure-detection regex matched its own command echo.
 
-`ssm_run.sh` invokes `aws ssm start-session` and pipes the command string into
-the session's stdin. The SSM session **echoes back the command line to stdout**
-before executing it. So `$OUT` contains, near its top, a line that literally
-reads:
+This was deterministic — every single iteration would have triggered the
+same false positive — but the `break` statement ensured we only saw it
+once.
 
-```
-$ tail -200 /opt/dlami/nvme/logs/v8_train.log 2>&1 | tr -d '\r' | \
-   grep -E "global_step|Killed|Error|nan|inf|OOM|SIGKILL|saved checkpoint|eval_loss" | \
-   ...
-```
+**Why the monitor stayed dead:**
+- No persistence across Claude session boundaries — local bash background
+  process tied to my Claude Code session
+- No file-based status that anyone (Leon, me on restart, anyone) could
+  poll independently
+- `break` on first alert = exit-permanently semantics
+- No external heartbeat to a file or webhook
 
-The babysitter's failure-detection regex `Killed|nan|inf.*loss|OOM|SIGKILL`
-then matched on the words `Killed`, `nan`, `OOM`, `SIGKILL` that appear inside
-the echoed grep arguments. **The monitor flagged itself as failed.**
+### Why these three failures compounded
 
-This was deterministic — every single iteration would have triggered the same
-false positive — but the `break` statement on first alert ensured we only saw
-it once.
+If only Failure 1 had occurred (without my broken monitor), Leon would
+likely have noticed within an hour via his own wandb-checking habits.
+~1 h cost.
 
-**Why it stayed broken:**
+If only Failure 3 had occurred (without the co-tenant kill), nothing bad
+would have happened. The run would have continued healthy through the
+night and Leon would have woken to working V8.
 
-1. **No persistence across Claude session boundaries.** The babysitter was a
-   local bash background process tied to my Claude Code session. Even if the
-   regex had been correct, when my Claude session restarted, the babysitter
-   would have continued running on Leon's laptop with no path to alert me. I
-   had no mechanism to be re-woken on event.
+Both together produced 9 h 20 m because:
+- I publicly committed to babysitting → Leon stopped checking wandb himself
+- My broken babysitter gave Leon no indication anything was wrong
+- I had no second layer (heartbeat staleness, on-box monitor, external page)
 
-2. **No file-based status that I could poll.** A correctly designed monitor
-   would write `/tmp/v8_status.json` every iteration with `{step, loss, mem,
-   proc_alive}`, and any future check could just read that file. Instead the
-   babysitter tried to be both producer and consumer in the same process —
-   when the producer died, the data died with it.
-
-3. **`break` on first alert was the wrong semantics.** Even for a real alert,
-   the correct behavior is to keep monitoring (or restart the loop) so we see
-   what happens AFTER the alert. Exiting permanently means we lose all
-   information about whether the situation resolves itself.
-
-4. **No external heartbeat.** The babysitter only printed when something
-   interesting happened. There was no "every 30 min, regardless, print a
-   heartbeat to a file with the current state". With heartbeats, the absence
-   of a fresh heartbeat itself becomes a signal.
-
-### Why these two failures compounded so badly
-
-If only the training had crashed (without my broken monitor), Leon would
-likely have noticed within an hour from his own wandb checking habits, and we
-would have lost ~1 h.
-
-If only my monitor had been broken (without the training crash), nothing bad
-would have happened — the run would have continued healthy through the night
-and Leon would have woken to an actually-working V8.
-
-Both failures together produced a 9 h 20 m blackout because:
-- I had publicly committed to babysitting (so Leon stopped watching wandb himself)
-- My broken babysitter gave Leon no indication anything was wrong (it didn't
-  alert because it was already dead from the false positive 9 min earlier)
-- I had no second layer (no heartbeat-staleness check, no wandb-based
-  watchdog, no cron on the box itself)
-
-**This is the same class as the previous V8 incidents:** silent default
-behavior + no surfaced loud signal. SDPA silently overrode FA3. Audio tower
-silently truncated PE. Now: SSM silently kills training, and my monitor
-silently dies on its own command echo. Pattern: any shared infrastructure
-that fails silently is a load-bearing dependency.
+Same class as previous V8 incidents: **silent default behavior + no
+surfaced loud signal**. SDPA silently overrode FA3. Audio tower silently
+truncated PE. Now: a co-tenant cleanup script silently kills any training
+on shared hardware, and my monitor silently dies on its own command echo.
 
 ## Part 3 — What we change
 
 ### Immediate (before relaunch)
 
-**1. Detach the training from any shell session.**
+**1. Coordinate with Zuocan BEFORE relaunching.**
 
-Edit the launcher invocation to use `setsid` + `nohup`. This is the simplest
-and most reliable detachment:
+Until we know when he's running and when he isn't, any relaunch is at risk.
+Specific asks:
+- "Are you running anything in the next 5 days?"
+- "When are you running cleanup? Is it on a schedule or ad-hoc?"
+- "Can your `gpu-clean.sh` check for a marker file before killing?"
+- "Can we agree on a marker-file convention for 'training in progress'?"
+
+This is a social fix and the most important one. Without it, all the
+technical fixes below are necessary but insufficient.
+
+**2. Marker-file convention for "training in progress."**
+
+Convention: anyone running training writes
+`/opt/dlami/nvme/RUNNING_<owner>_<runid>.lock` with their wandb URL and
+contact info before launch. Anyone running cleanup checks for any
+`/opt/dlami/nvme/RUNNING_*.lock` and bails out with a loud message if
+present.
+
+Proposed patch to `gpu-clean.sh`:
+```bash
+LOCKS=$(ls /opt/dlami/nvme/RUNNING_*.lock 2>/dev/null)
+if [ -n "$LOCKS" ]; then
+  echo "REFUSING to clean: active training locks present:"
+  for f in $LOCKS; do echo "  $f:"; cat "$f"; done
+  exit 1
+fi
+```
+
+**3. Detach the launcher (setsid nohup) anyway.**
+
+Even though detachment doesn't solve THIS failure mode, it solves the
+class we feared initially (SSH disconnect, SSM session timeout, terminal
+exit) and is cheap insurance:
 
 ```bash
-# Instead of:
-bash sft.sh CONFIG 2>&1 | tee /opt/dlami/nvme/logs/v8_distributed.log
-
-# Use:
-setsid nohup bash sft.sh CONFIG > /opt/dlami/nvme/logs/v8_distributed.log 2>&1 < /dev/null &
-echo "training started, pid=$!"
+setsid nohup bash sft.sh CONFIG > log 2>&1 < /dev/null &
+echo "training pid=$!"
 disown $!
 ```
 
-`setsid` creates a new session detached from any controlling terminal.
-`nohup` ignores SIGHUP. The redirected stdin (`< /dev/null`) prevents
-read-from-terminal blocks. `disown` removes the job from the shell's job
-table so even `exit` won't reach it.
-
-Alternative: launch inside tmux/screen. Equally valid. tmux additionally
-lets us `tmux attach` later to inspect.
-
-**2. Build a file-based monitor that survives Claude session restarts.**
+**4. File-based monitor on the AWS box.**
 
 Architecture:
-- A `health_writer.sh` runs on the AWS box (under `setsid nohup`), polling
-  the training log every 60 s and writing `/opt/dlami/nvme/health/v8_status.json`
-  with `{ts, step, loss, grad_norm, mem_gb, proc_alive, last_log_line}`.
-- A `health_reader.sh` runs on Leon's laptop (or anywhere) when invoked,
-  doing one SSM call to `cat` the status file. Single-shot, no persistence
-  needed. Returns parseable JSON.
-- My role: invoke `health_reader.sh` whenever I'm asked to check, or set up
-  a Claude Code wakeup at decision-point intervals (step 50 eval, step 75
-  ckpt).
+- `health_writer.sh` runs on the AWS box (under `setsid nohup`), polls
+  `/opt/dlami/nvme/logs/v8_train.log` every 60 s and writes
+  `/opt/dlami/nvme/health/v8_status.json` with `{ts, step, loss,
+  grad_norm, mem_gb, proc_alive, last_log_line}`.
+- `health_reader.sh` runs on Leon's laptop / anywhere, single SSM
+  SendCommand to `cat` the status file. Transient, no persistence needed.
+- My role: invoke `health_reader.sh` whenever asked, OR wake up at
+  decision-point intervals (step 50 eval, step 75 ckpt).
 
-This separates "produce monitoring data" (persistent process on the box, owns
-the data file) from "consume monitoring data" (transient query, reads the
-file). No long-running local process needed.
+This separates "produce monitoring data" (persistent process on the box,
+owns the data file) from "consume monitoring data" (transient query,
+reads the file). No long-running local process required.
 
-**3. Fix the regex bug class permanently.**
+**5. Fix the regex bug class permanently.**
 
-The babysitter regex matched its own command echo. The lesson generalizes:
-when grepping output that may contain command-text or shell-echoed args,
-either:
-- Grep against a file directly (`grep PATTERN /path/to/log` — bypasses any
-  command-echo problem), OR
-- Use a sentinel-delimited region: `echo ===BEGIN===; <command>; echo ===END===`
-  and `awk` to extract only the region between sentinels.
+The lesson generalizes beyond this monitor: when grepping output that may
+contain command-text or shell-echoed args, EITHER:
+- Grep against a file directly (`grep PATTERN /path/to/log` — bypasses
+  the command-echo problem), OR
+- Use sentinel-delimited regions: `echo '===BEGIN==='; <command>;
+  echo '===END==='` and `awk` to extract only the region between
+  sentinels.
 
-For this monitor specifically: read `/opt/dlami/nvme/logs/v8_train.log`
-directly via `tail -n 200 /opt/dlami/nvme/logs/v8_train.log` and grep the
-result, never the SSM session stdout.
+For this monitor specifically: have the on-box writer read
+`/opt/dlami/nvme/logs/v8_train.log` directly. Never grep SSM session
+stdout.
 
-**4. Word-boundary the failure regex.**
-
+**6. Word-boundary the failure regex.**
 Replace `grep -E "Killed|nan|inf|OOM|SIGKILL"` with
-`grep -E "\bKilled\b|\bnan\b|\bOOM\b|\bSIGKILL\b"` so partial matches
-("info", "inference", "training") don't false-trigger.
+`grep -E "\bKilled\b|\bnan\b|\bOOM\b|\bSIGKILL\b"`.
 
-**5. Never `break` on alert. Log + continue.**
-
+**7. Never `break` on alert. Log + continue.**
 The right semantics: alert, write status, keep polling. We want to know
-whether the situation resolved itself, or whether subsequent state confirms
+whether the situation resolved itself OR whether subsequent state confirms
 the alert.
 
 ### Process changes
 
-**6. Pre-launch detachment smoke.**
+**8. Pre-launch announcement.**
+For any multi-hour run on shared hardware: announce in team chat
+(Slack/WeChat/whatever) with start time, expected duration, wandb URL,
+and how to reach you for stop/coordination. **No silent launches on
+shared boxes.**
 
-Before any multi-hour run, verify the launcher detaches correctly: launch
-the script, immediately close the SSM session, wait 90 s, reconnect with a
-new SSM session, verify the training processes are still alive. Add to the
-V8 launch runbook as a mandatory step.
+**9. Pre-launch detachment smoke.**
+Before any multi-hour run, verify the launcher detaches correctly: launch,
+immediately close the SSM session, wait 90 s, reconnect with a new SSM
+session, verify training processes are still alive. Add to V8 launch
+runbook as mandatory step.
 
-**7. Two-layer monitoring contract.**
-
+**10. Two-layer monitoring contract.**
 For any training run > 1 GPU-hour, require:
-- **Layer 1**: wandb dashboard URL pinned in run notes (Leon can check
-  directly without me)
+- **Layer 1**: wandb dashboard URL pinned in run notes
 - **Layer 2**: file-based health-writer on the box producing a status file
   every 60 s
-- **Layer 3**: my Claude wakeups at known decision points (step 50, step 75,
-  step 200, etc.) reading the status file
+- **Layer 3**: my Claude wakeups at known decision points
 
 No single layer is allowed to be the only source of truth.
 
-**8. Honesty contract.**
-
+**11. Honesty contract.**
 If I cannot reliably monitor a run (e.g., because Claude sessions don't
 persist across my own restarts), I must say so explicitly rather than
-promising to "babysit". This incident's deepest failure was social, not
-technical: I claimed monitoring coverage I couldn't actually provide.
+promising to "babysit". This incident's deepest failure mode was social,
+not technical: I claimed coverage I couldn't actually provide.
 
 ### Reproducing the diagnosis (for future incidents)
 
 ```bash
-# Confirm SSM-timeout-kill pattern on a node:
-TARGET=<i-id> REGION=<reg> AWS_PROFILE=<profile> ssm_run.sh \
-  "tail -100 /opt/dlami/nvme/logs/v8_train.log | grep -B2 -A8 'Root Cause'"
+# 1. Get root access to the box (any user with gpu-box AWS profile)
+aws ssm send-command \
+  --instance-ids <i-id> --document-name "AWS-RunShellScript" \
+  --parameters "commands=[\"cat /var/log/auth.log | tail -100\"]" \
+  --region <region> --profile <profile>
 
-# Look for the SIGKILL exit -9 / SIGTERM exit -15 mix pattern.
-# If you see this pattern WITHOUT NaN/OOM/GPU errors, suspect external signal.
+aws ssm get-command-invocation \
+  --command-id <returned-cmd-id> --instance-id <i-id> \
+  --region <region> --profile <profile>
 
-# Verify launcher detachment:
-grep -E "nohup|setsid|disown|tmux|screen" /opt/dlami/nvme/launch_training_2node.sh
-# 0 matches → launcher is undetached, vulnerable to SSM timeout
+# 2. Search for SIGKILL + pkill events in auth.log around the death time:
+grep "07:23" /var/log/auth.log
+
+# 3. Find the SendCommand script that ran the kill:
+find /var/lib/amazon/ssm/<i-id>/document/orchestration \
+  -name "_script.sh" -newermt "<death-time-minus-10s>" \
+  ! -newermt "<death-time-plus-10s>"
+
+# 4. Read each candidate to identify the kill script:
+cat <orchestration>/awsrunShellScript/0.awsrunShellScript/_script.sh
 ```
 
 ## Affected files
 
-- `/opt/dlami/nvme/launch_training_2node.sh` — needs `setsid nohup` wrapper added
-- `/tmp/v8_babysit.sh` — to be replaced by `health_writer.sh` (on box) +
-  `health_reader.sh` (off box)
+- `/opt/dlami/nvme/launch_training_2node.sh` — needs `setsid nohup`
+  wrapper added
+- `/opt/dlami/nvme/gpu-clean.sh` — needs marker-file guard (Zuocan's
+  script, requires coordination)
+- `/tmp/v8_babysit.sh` — to be replaced by on-box `health_writer.sh` +
+  off-box `health_reader.sh`
 - `examples/train/grpo/qwen2_5_omni_ttcc/V8_LAUNCH_RUNBOOK.md` — add
-  "verify detachment" smoke step
+  "announce + smoke + marker file" steps
 
 ## Related incidents
 
@@ -337,21 +372,23 @@ grep -E "nohup|setsid|disown|tmux|screen" /opt/dlami/nvme/launch_training_2node.
 - [INCIDENT_2026-05-26_EVAL_LEAK.md](../../../../ttcc-eval/INCIDENT_2026-05-26_EVAL_LEAK.md) —
   V7 R(t) leak in assistant span
 
-**Common pattern across all four:** silent default value + no surfaced loud
-signal. The "any shared infrastructure that fails silently is a load-bearing
-dependency" rule (from the AUDIO_OOB incident) now extends to: **the same is
-true for any monitor.** A silently-failing monitor is worse than no monitor,
-because it gives false confidence.
+**Common pattern across all four:** silent default value or silent action +
+no surfaced loud signal. A silently-failing monitor is worse than no
+monitor; a silently-killing cleanup is worse than no cleanup.
 
 ## Aphorisms
 
-- "Grep against files, not stdout streams that echo your own command back."
+- "Shared hardware without a coordination protocol is private hardware
+  with a roulette wheel."
 - "A monitor without persistence is a wish. A monitor without
-  cross-restart-survivability is a smoke detector that requires you to be
-  awake to hear it."
+  cross-restart-survivability is a smoke detector that requires you to
+  be awake to hear it."
+- "Grep against files, not stdout streams that echo your own command back."
 - "`break` on alert is the wrong semantics. Alert and keep watching — the
   next 60 seconds tell you whether you saw a glitch or a fire."
 - "If you cannot promise to monitor, do not claim to babysit. The social
-  failure is the deepest failure mode of this incident."
-- "SSM Session Manager is a remote shell, not a daemon. Anything launched
-  from it dies with it. Plan for the disconnection that always comes."
+  failure is the deepest failure of this incident."
+- "When debugging crashes on shared infrastructure: `auth.log` first,
+  hypotheses second."
+- "The fix for 'shared credentials, no human distinction' is not technical;
+  it's a coordination protocol."
