@@ -27,6 +27,14 @@ KSRC=/opt/dlami/nvme/work/fa3_kernel/build/torch212-cxx11-cu130-x86_64-linux/fla
 cp -r $KSRC $SP/flash_attn_3
 echo 'from flash_attn_3.flash_attn_interface import *' > $SP/flash_attn_interface.py
 
+# 3b. CRITICAL: cp -r does NOT register pip metadata. transformers'
+#     _is_package_available() calls importlib.metadata.version() which
+#     returns PackageNotFoundError → returns False → FA3 is_available
+#     returns False even though imports work. Fake the dist-info:
+mkdir -p $SP/flash_attn_3-3.0.0.dist-info
+printf 'Metadata-Version: 2.1\nName: flash_attn_3\nVersion: 3.0.0\n' \
+    > $SP/flash_attn_3-3.0.0.dist-info/METADATA
+
 # 4. Verify
 $VENV/bin/python -c '
 import importlib.util
