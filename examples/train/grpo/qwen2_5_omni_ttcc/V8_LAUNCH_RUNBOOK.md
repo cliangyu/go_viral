@@ -281,6 +281,51 @@ bash /opt/dlami/nvme/go_viral/examples/custom/qwen2_5_omni_retention/tools/valid
 # Exits 0 = safe to launch. Exits 1 = do NOT launch; debug first.
 ```
 
+### Step 7.5 — Post-incident defenses (added 2026-05-28)
+
+Before launching, deploy the defenses that came out of the
+[2026-05-28 incidents](INCIDENT_2026-05-28_TRAINING_CRASH_AND_MONITOR_GAP.md):
+marker file, on-box health monitor, wandb env auto-source, and (on
+shared boxes) `gpu-clean.sh` lockdown.
+
+These are bundled in `ops/post_incident_setup.sh`. Idempotent — safe to
+re-run.
+
+```bash
+cd /opt/dlami/nvme/go_viral
+bash examples/train/grpo/qwen2_5_omni_ttcc/ops/post_incident_setup.sh \
+    --owner $USER \
+    --runid v8-$(date +%Y%m%d-%H%M%S) \
+    --wandb-url https://wandb.ai/liangyuch/ttcc \
+    --contact your_email@example.com \
+    --lock-gpu-clean    # only on shared boxes where cleanup automation runs
+```
+
+The script:
+1. Writes `WANDB_API_KEY` to `/opt/dlami/nvme/wandb_env.sh` from `~/.netrc`
+   so swift can pick it up automatically (closes the wandb auth-failure
+   crash from 2026-05-28 relaunch attempt #2).
+2. Writes `/opt/dlami/nvme/RUNNING_<owner>_<runid>.lock` so any cleanup
+   automation (like the `zane-ai-agent` incident at 07:23 UTC) can detect
+   an active run and bail.
+3. (With `--lock-gpu-clean`) Replaces `gpu-clean.sh` with a refusal banner
+   and `chattr +i`'s it. Defense-in-depth alongside an IAM Deny on the
+   actor running cleanup.
+4. Starts `/opt/dlami/nvme/health_writer.sh` under `setsid nohup` so it
+   survives SSH/SSM disconnects. Writes
+   `/opt/dlami/nvme/health/v8_status.json` every 30s.
+
+**Coordination protocol** (on shared boxes):
+- IAM Deny is the primary defense. Add an inline policy to any cleanup
+  agent that targets `Resource: arn:aws:ec2:<region>:<acct>:instance/<i-...>`
+  for the instances you're running on. See
+  `INCIDENT_2026-05-28_TRAINING_CRASH_AND_MONITOR_GAP.md` Part 3 for the
+  exact JSON.
+- Marker file is the secondary signal — visible to any human or agent
+  that lists `/opt/dlami/nvme/RUNNING_*.lock`.
+- The `gpu-clean.sh` chattr +i lock is belt-and-suspenders that survives
+  IAM policy removal.
+
 ### Step 8 — Launch V8 (the actual training)
 
 The launcher `sft.sh` is at
@@ -315,16 +360,29 @@ The yaml has `report_to: [tensorboard, wandb]`. Runs appear at
 
 ### Step 9 — Monitor (first 200 steps)
 
+The `ops/post_incident_setup.sh` step started `health_writer.sh` which
+writes a status JSON every 30s. Prefer reading that over re-greppping
+the log on each check:
+
 ```bash
-# Health check
+# Live status (always fresh, ≤30s old)
+cat /opt/dlami/nvme/health/v8_status.json
+
+# Alert log (only writes on PROCESS_DIED / STEP_STALE_>600s / RuntimeError)
+tail /opt/dlami/nvme/health/v8_alerts.log
+
+# Optional: legacy ad-hoc inspection
 pgrep -af "swift sft" | head
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
-tail -50 /opt/dlami/nvme/logs/v8_main.log | tr '\r' '\n' | tail -20
-
-# Loss progression
 grep -oE "'loss': [0-9.eE+-]+|'global_step/max_steps': '[0-9]+/[0-9]+'|'token_acc': [0-9.eE+-]+" \
-    /opt/dlami/nvme/logs/v8_main.log | tail -30
+    /opt/dlami/nvme/logs/v8_distributed.log | tail -30
 ```
+
+The register.py loss-split patch (commit after 2026-05-28) also wires
+`loss_curve` and `loss_cot` into swift's `custom_metrics` pipeline. They
+appear in wandb as separate scalars; check there for "is retention head
+actually learning vs is LM head drifting" — see register.py docstring
+just below the `_is_packed_sequence` patch for the rationale.
 
 **Success signals at step 100-200:**
 - `train/loss` decreasing
