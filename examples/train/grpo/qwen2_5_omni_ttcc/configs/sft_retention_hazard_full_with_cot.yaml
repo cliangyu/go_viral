@@ -89,17 +89,36 @@ tuner_type: full
 freeze_vit: true
 freeze_aligner: true
 
-# ZeRO-2 (not ZeRO-3) chosen 2026-05-28 after profiling showed the previous
-# ZeRO-3 run sat at 26% TDP, 38C GPU temp, 74% SM% (high SM% = NCCL kernels
-# spinning on all-gather; tensor cores idle most of step). With 3.4B trainable
-# params, the comm cost per step was the dominant wall-clock contributor.
-# ZeRO-2 keeps params replicated per rank (+~6 GB/rank memory; we had 26 GB
-# headroom on H100 80 GB) and only shards optimizer state + gradients →
-# eliminates the per-layer all-gather, expected 5-15% speedup.
+# ZeRO-3 (reverted from ZeRO-2 on 2026-05-28 17:59 UTC).
+#
+# We tried ZeRO-2 to recover the 5-15% speed loss from comm overhead, but it
+# triggered a separate bug in swift/template/templates/qwen.py:906-911:
+#
+#   if input_features is None:
+#       if is_deepspeed_enabled() and not is_deepspeed_zero3_enabled():
+#           # Note: ZeRO-3 still results in hangs; for audio training, please use ZeRO-2.
+#           input_features = input_ids.new_zeros([1, 128, 128], ...)
+#           audio_res = model.thinker.get_audio_features(input_features, ...)
+#
+# With audios=[] in our jsonl rows, input_features is None. Under ZeRO-2 the
+# template invokes audio_tower with a DUMMY zero tensor (to keep gradient sync
+# alive across ranks). audio_tower then hits the cu_seqlens 3D FA3 bug we
+# already documented in INCIDENT_2026-05-28_AUDIO_OOB.md. Under ZeRO-3 this
+# code path is skipped entirely (the template has it gated behind
+# `not is_deepspeed_zero3_enabled()`), so audio_tower is never called and the
+# FA3 issue doesn't surface.
+#
+# Going back to ZeRO-3 is the lowest-risk path: we know it ran for 15 steps
+# without the audio_tower path firing. The speed cost is 5-15% which we have
+# budget for given CB ~120h remaining.
+#
+# Future: to recover the ZeRO-2 speedup, either (a) patch the swift template
+# to skip the dummy audio call when no audio is in the row, or (b) force
+# audio_tower to use SDPA via config override in register.py.
 gradient_checkpointing: true
 vit_gradient_checkpointing: true
 torch_compile: false                          # head is too small to amortize compile
-deepspeed: zero2
+deepspeed: zero3
 
 # 10 epochs because we're training from base (random retention head).
 # V7 reached its plateau at ~6 epochs from base init; expect similar.
