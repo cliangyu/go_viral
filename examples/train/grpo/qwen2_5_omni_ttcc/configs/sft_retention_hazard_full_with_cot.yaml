@@ -58,10 +58,22 @@ ENV:
 dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot.jsonl
 val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
 eval_strategy: steps
-# max_length=49152 eliminates the ~18% drop rate observed at 32768
-# (long ads exceed 33k–45k tokens; capping at 49152 gives 0 skips on 300-ad sample).
-# Verify GPU memory headroom holds with this bump on the target H100 box before launch.
-max_length: 49152
+# max_length=32768 chosen 2026-05-28 based on actual token measurement
+# (60-row sample on no-audio jsonl). With audio dropped:
+#   - video tokens scale ~600/sec; 60s ads ~36K tokens (60 frames * 600)
+#   - text tokens (system + user + <cot>...) ~200-770
+#   - audio tokens 0 (USE_AUDIO_IN_VIDEO=false + audios=[])
+#
+# At max_length=49152 the long ads (T>54s, ~15% of corpus) push GPU
+# activation memory past 80GB on H100 with ZeRO-3 + max grad_accum=8.
+# Step 1 completed at memory=36GB but step 2 with a longer batch SIGKILL'd.
+# Choosing 32768 trades ~15% data drop (T<=54s ads kept) for stable
+# 60-80GB GPU memory headroom.
+#
+# truncation_strategy=delete drops rows over the cap (vs truncate-right
+# which would chop the assistant <cot>...</cot> tail — that's load-bearing
+# for the retention head anchor at h[</cot>]).
+max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
