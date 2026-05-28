@@ -36,6 +36,34 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel
 from typing import Optional
 
+# =====================================================================
+# CRITICAL: transformers v4.56.x + FA3 + Qwen2.5-Omni TMRoPE bug
+# =====================================================================
+# Qwen2.5-Omni uses 3D position_ids shape [3, batch, seq] (time/H/W).
+# transformers' _is_packed_sequence() indexes position_ids.shape[1]
+# blindly and falsely returns True -> prepare_fa_kwargs_from_position_ids
+# generates a wrong-sized cu_seqlens -> FA3's strict 1D check raises
+# RuntimeError("cu_seqlens_q must have 1 dimensions, got 3").
+#
+# FA2 silently allowed the OOB read (this is why V7's FA2 run did not
+# crash -- but the attention values were mathematically incorrect).
+#
+# The fix is from transformers PR #44911 (closed unmerged):
+#   if position_ids.dim() > 2: return False
+#
+# We monkey-patch on plugin import so it applies before any model load.
+# See INCIDENT_2026-05-28_AUDIO_OOB.md and FLASH_ATTENTION_INSTALL.md.
+try:
+    import transformers.modeling_flash_attention_utils as _fa_utils
+    _orig_is_packed = _fa_utils._is_packed_sequence
+    def _patched_is_packed(position_ids, batch_size):
+        if position_ids is not None and position_ids.dim() > 2:
+            return False
+        return _orig_is_packed(position_ids, batch_size)
+    _fa_utils._is_packed_sequence = _patched_is_packed
+except (ImportError, AttributeError):
+    pass
+
 from swift.loss import BaseLoss, loss_map
 from swift.model import (Model, ModelGroup, ModelLoader, ModelMeta, MultiModelKeys,
                          register_model, register_model_arch)
