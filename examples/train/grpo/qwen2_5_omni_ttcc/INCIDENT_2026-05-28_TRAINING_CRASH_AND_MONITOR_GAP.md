@@ -116,6 +116,57 @@ checkpoint backup utility located at `/opt/dlami/nvme/ckpt-s3-watcher.sh`,
 created 04:02 UTC) which is **Zuocan's infrastructure** — I have no such
 utility in my codebase.
 
+**Intent analysis (what was Zuocan trying to do, and why):**
+
+The script's primary goal is "thorough GPU free" — return all 8 GPUs to
+0 MiB used and 0% util so a fresh training run can launch into a clean
+state. Reading the script's design choices reveals the implicit assumptions:
+
+| Design choice | Implied prior experience |
+|---|---|
+| `nvidia-smi --query-compute-apps=pid` → kill by PID (not by name first) | Has experienced **zombie/orphan GPU processes** that don't match `pkill -f swift` but still hold GPU memory. The author has been burned by "memory occupied but no swift process found" before. |
+| `# belt-and-suspenders by name too` (the comment exactly) | The author distrusts either method alone — wants both PID-based AND name-based cleanup. |
+| `sleep 10` then verify | Knows that SIGKILL → kernel reap → GPU memory release can take several seconds. The verify step ("want ~0 MiB all 8") confirms the cleanup succeeded. |
+| Final `pgrep -f ckpt-s3-watcher.sh` check | Explicitly checks that the **S3 checkpoint backup watcher survived the cleanup**. They want the backup utility to keep running even when training is reset. This implies they save checkpoints continuously and don't want to lose that capability. |
+| No SIGTERM-first / no grace period | Optimizing for speed of cleanup over safety. Iterate-debug cycle, not production. |
+| No exclusion list, no "is anyone else using this" check | **The script's mental model is single-user.** The author assumed they were the only tenant. |
+
+**Inferred workflow** (Zuocan's iteration loop):
+1. Launch training run (their own variant — different config, possibly different
+   data, definitely different from ours)
+2. Observe results in real time, decide whether to abort early
+3. When ready for next iteration: run `gpu-clean.sh` to nuke GPU state
+4. Verify the cleanup worked (the "AFTER" diagnostic block)
+5. Verify `ckpt-s3-watcher.sh` is still alive (don't lose ckpt backup)
+6. Launch next iteration
+
+This is a **completely reasonable utility for solo iteration on a research
+box.** The author solved a real problem they had — zombie GPU processes
+that wouldn't die from `pkill -f` alone. The bug is not in the script's
+logic; it's in the script's MENTAL MODEL: "all GPU processes are mine and
+all are safe to kill."
+
+**Recurrence pattern indicates this was a debug session.** Four
+invocations at 02:09, 05:48, 05:50, 07:23 with irregular gaps (3 h → 5 min
+→ 1.5 h). This is classic single-developer iteration:
+- 02:09: Initial cleanup at start of work session
+- 04:02–05:50: Focused 2-h iteration burst (write code → launch → kill →
+  clean → relaunch loop)
+- 05:50 → 07:23: 1.5-h gap (possibly went AFK, ate breakfast, took a meeting)
+- 07:23: Returned, ran cleanup as the **first ritual of the new iteration
+  attempt**, ready to launch their next variant
+
+We happened to launch in that 1.5-h gap. When Zuocan came back and ran his
+cleanup ritual to prepare for HIS next run, it killed OURS — because his
+script has no way to know our run is different from his old zombie process.
+
+**Why this is the right call to make peace with, not be angry about:**
+The cleanup script is well-designed for its intended use. It addresses a
+real reliability problem (zombie GPU procs). The fix is not "Zuocan should
+not have run his script"; the fix is "shared-tenancy boxes need a
+coordination protocol that solo iteration scripts can be taught to
+respect." See Part 3.
+
 **Recurrence:** This is **not a one-off event.** Auth log shows four
 distinct invocations on the same day:
 
