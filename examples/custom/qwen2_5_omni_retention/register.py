@@ -64,6 +64,66 @@ try:
 except (ImportError, AttributeError):
     pass
 
+
+# =====================================================================
+# Wire RetentionLoss sub-losses into swift's custom_metrics pipeline so
+# wandb/tensorboard see loss_curve / loss_cot / cot_alpha separately.
+#
+# Why this exists:
+#   RetentionLoss returns total = loss_curve + alpha * loss_cot. swift's
+#   trainer logs only `loss` (the total) by default. Without this patch,
+#   we cannot see which term is driving the total down — bad for
+#   diagnosing whether retention head is learning vs LM head is drifting.
+#
+# How this works (matches swift's own aux_loss pattern at
+# swift/trainers/seq2seq_trainer.py:141-142):
+#   1. RetentionLoss already stashes loss_curve/loss_cot/cot_alpha on the
+#      model holder (see line ~688 below).
+#   2. After every compute_loss, we read them off the holder and call
+#      self.custom_metrics[mode][name].update(value).
+#   3. swift's log() at trainers/mixin.py:980-985 auto-merges these into
+#      the logs dict via compute_custom_metrics() and routes them to
+#      wandb/tensorboard with prefix='' for train, 'eval_' for eval.
+#
+# This is the same pipeline transformers uses for mixture-of-experts
+# auxiliary loss. No callback registration, no new infrastructure.
+# =====================================================================
+try:
+    from swift.trainers.seq2seq_trainer import Seq2SeqTrainer
+    _orig_compute_loss = Seq2SeqTrainer.compute_loss
+
+    def _compute_loss_with_retention_metrics(self, model, inputs,
+                                             return_outputs=False,
+                                             num_items_in_batch=None):
+        result = _orig_compute_loss(self, model, inputs,
+                                    return_outputs=return_outputs,
+                                    num_items_in_batch=num_items_in_batch)
+        try:
+            base = self.accelerator.unwrap_model(model)
+            for attr in ('base_model', 'model'):
+                inner = getattr(base, attr, None)
+                if inner is not None and getattr(inner, '_retention_h_holder', None) is not None:
+                    base = inner
+                    break
+            holder = getattr(base, '_retention_h_holder', None)
+            if holder is not None:
+                mode = 'train' if self.model.training else 'eval'
+                if holder.loss_curve is not None:
+                    self.custom_metrics[mode]['loss_curve'].update(holder.loss_curve)
+                if holder.loss_cot is not None:
+                    self.custom_metrics[mode]['loss_cot'].update(holder.loss_cot)
+                if holder.cot_alpha is not None:
+                    self.custom_metrics[mode]['cot_alpha'].update(holder.cot_alpha)
+        except (AttributeError, KeyError):
+            # Holder/model structure changed; metrics won't log but training continues.
+            pass
+        return result
+
+    Seq2SeqTrainer.compute_loss = _compute_loss_with_retention_metrics
+except (ImportError, AttributeError):
+    pass
+
+
 from swift.loss import BaseLoss, loss_map
 from swift.model import (Model, ModelGroup, ModelLoader, ModelMeta, MultiModelKeys,
                          register_model, register_model_arch)
