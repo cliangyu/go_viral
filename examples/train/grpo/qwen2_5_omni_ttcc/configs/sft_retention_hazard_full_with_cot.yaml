@@ -25,7 +25,7 @@
 
 model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
 torch_dtype: bfloat16
-attn_impl: flash_attn
+attn_impl: flash_attention_3
 
 external_plugins:
   - examples/custom/qwen2_5_omni_retention/register.py
