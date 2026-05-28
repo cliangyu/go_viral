@@ -89,11 +89,17 @@ tuner_type: full
 freeze_vit: true
 freeze_aligner: true
 
-# Full FT needs ZeRO-3 to fit the optimizer state (Adam fp32 ≈ 8× param size).
+# ZeRO-2 (not ZeRO-3) chosen 2026-05-28 after profiling showed the previous
+# ZeRO-3 run sat at 26% TDP, 38C GPU temp, 74% SM% (high SM% = NCCL kernels
+# spinning on all-gather; tensor cores idle most of step). With 3.4B trainable
+# params, the comm cost per step was the dominant wall-clock contributor.
+# ZeRO-2 keeps params replicated per rank (+~6 GB/rank memory; we had 26 GB
+# headroom on H100 80 GB) and only shards optimizer state + gradients →
+# eliminates the per-layer all-gather, expected 5-15% speedup.
 gradient_checkpointing: true
 vit_gradient_checkpointing: true
 torch_compile: false                          # head is too small to amortize compile
-deepspeed: zero3
+deepspeed: zero2
 
 # 10 epochs because we're training from base (random retention head).
 # V7 reached its plateau at ~6 epochs from base init; expect similar.
