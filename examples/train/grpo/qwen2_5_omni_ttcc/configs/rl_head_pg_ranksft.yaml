@@ -1,0 +1,86 @@
+# STEP-1 — SUPERVISED cross-ad pairwise-rank SFT (NOT RL). HPG_OBJECTIVE=rank_sft.
+#
+# WHY (RL_INVESTIGATION_LOG §6 decision): runs 1-4 (head-PG REINFORCE) could not beat
+# the SFT baseline (val cross-ad SRCC 0.5142). Diagnosis: the bottleneck is that the model
+# UNDER-EXTRACTS the retention LEVEL from the video (head-ceiling oracle caps at ~0.515 on the
+# current bypass features; labels are clean — privileged R(1)/mean baselines reach 0.78-0.95).
+# RL is a weak, high-variance tool for *learning new features* (RLVR elicits, doesn't add) and
+# over-optimized the noisy train orderings (train reward up, val SRCC down). We HAVE dense labels,
+# so SUPERVISED pairwise-rank is the effective, sample-efficient tool to LEARN/RESHAPE features.
+#
+# This run is BOTH (a) the most effective feature-learning attempt AND (b) the decisive, cheap
+# test of whether the video features can be reshaped past 0.515:
+#   >0.515 at some checkpoint -> reshapable -> proceed (then RL to elicit/sharpen, Step-2).
+#   ~=0.515 flat            -> video saturated -> audio is the only NEW-information lever.
+#
+# OBJECTIVE (head_pg_trainer._rank_sft_loss): for ad A (r_pred grad-connected = R(1..Tmax)) vs a
+# detached per-GPU running buffer of recent ads B:
+#   loss = mean_{t,B valid} -log sigma( beta*(R_A(t)-R_B(t)) * sign(R^true_A(t)-R^true_B(t)) )
+#          + alpha_mse * MSE(R_A, R^true_A)            # calibration anchor (keeps absolute level)
+#   only pairs with |true gap| >= margin (large-margin LtR -> generalizes; drops noisy near-ties).
+# Gradient flows R_A(t) -> head -> backbone (DENSE) with FREEZE_BACKBONE=0 -> reshapes the video
+# representation. This directly optimizes the per-second cross-ad concordance the eval (SRCC) scores.
+#
+# Trains UNDER THE BYPASS FORWARD (assistant=<cot></cot>, head reads the literal last token) so
+# train == eval exactly. Save ALL checkpoints; select on held-out val_200 SRCC (eval box, separate).
+#
+# ** per_device_train_batch_size MUST be 1 ** (head reads the LITERAL last token; bs>1 right-pads
+# -> L-1 becomes a PAD hidden -> mismatches eval). Scale via grad-accum + more GPUs, not bs.
+# ** LAUNCH WITH rl.sh -> rl/train_head_pg.py — NOT `swift sft`. **
+
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-225  # SFT ckpt-225 (val SRCC 0.5142) — the baseline to beat; init here
+torch_dtype: bfloat16
+attn_impl: flash_attn               # PINNED; eval baseline must match this kernel
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # asserted at init (rrank fallback); unused by rank_sft
+  HPG_OBJECTIVE: 'rank_sft'         # <<< STEP-1: supervised differentiable pairwise-rank loss (no rollouts, no REINFORCE)
+  HPG_FREEZE_BACKBONE: '0'          # reshape the backbone features (the whole point); zero3 partitions cleanly
+  HPG_ALPHA_MSE: '0.1'              # small MSE calibration anchor (prevents rank-only level drift)
+  HPG_BETA: '50.0'                  # concordance sigmoid sharpness (matches run-3/4 gate: +0.64 cosine)
+  HPG_MARGIN: '0.05'                # only score ad-pairs with |true gap|>=0.05 (drop noisy near-ties -> generalizes)
+  HPG_TLO: '1'
+  HPG_THI: '30'
+  HPG_BUF: '256'                    # per-GPU FIFO of recent ads' (pred curve, true curve, T)
+  HPG_BUF_MIN: '64'                 # warmup: no rank loss until buffer >= this (fills in ~8 optimizer steps)
+
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl   # assistant=<cot></cot>, video+R (matches eval bypass forward)
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+tuner_type: full
+freeze_vit: true                    # mirror SFT (vit/aligner frozen; LLM+head train)
+freeze_aligner: true
+
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+deepspeed: zero3                    # PROVEN SFT backend; works via mu_z-from-output derivation
+
+num_train_epochs: 1                 # ~559 steps at eff. batch 64 (1*8 accum*8 gpu); cheap reshapability test. Extend if SRCC moves.
+learning_rate: 5.0e-6               # SFT's proven full-FT lr (dense supervised signal; save-all + held-out selection captures the peak even if it overshoots)
+warmup_ratio: 0.03
+max_grad_norm: 1.0                  # == HPG_CLIP
+per_device_train_batch_size: 1      # REQUIRED (see header)
+gradient_accumulation_steps: 8      # effective ads/step = 1 * 8 * world_size (=64 on 1x8)
+
+logging_steps: 1
+eval_strategy: 'no'                 # held-out cross-ad SRCC tracked separately per-checkpoint (eval box)
+save_steps: 25
+save_total_limit: 40                # save ALL ckpts across the epoch (per the decision: select on held-out)
+report_to: [tensorboard, wandb]     # wandb key lives in /home/ssm-user/.netrc; export WANDB_API_KEY in the launch (root nohup doesn't read ssm-user netrc). project=ttcc.
+output_dir: /opt/dlami/nvme/ssm-out/rl_head_pg_ranksft
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

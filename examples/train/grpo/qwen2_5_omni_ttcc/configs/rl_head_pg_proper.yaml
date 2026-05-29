@@ -1,0 +1,80 @@
+# PROPER RL (Node B, 8xH100) — the morning head-PG REINFORCE done RIGHT.
+#
+# Answers the open question "did RL fail, or was it underpowered?" by fixing every morning
+# failure mode while keeping the ONE thing that worked (the cross-ad concordance reward,
+# cosine +0.59 vs the SRCC-improving direction):
+#   morning run-3: 25-75 steps, lr 1e-6 (KL stayed ~0.03, policy barely moved), per-GPU buffer
+#                  256, no best-ckpt selection, measured on a noise-dominated eval (n=158).
+#   THIS run    : ~560 steps (2 epochs, 10x longer), ga16 -> eff-batch 128 (MATCHES the 16-card
+#                  baseline; see feedback_match_baseline_topology_eff_batch), buffer 512,
+#                  save-all + best-ckpt-on-held-out, evaluated on the FIXED (expanded) eval.
+#
+# Init from ckpt-225 (current features). This is the "proper RL from the current features" shot;
+# RL Arm A on the *reshaped* features (if rank-SFT on Node A wins) is a separate later run.
+#
+# lr/KL: kept at the literature-safe full-FT-RL 1e-6 / KL 0.03 for now (protects ckpt-225);
+# the under-training (75 steps) was the dominant morning bug, not lr. If still flat after 2
+# epochs with best-ckpt, THEN raise lr / lower KL. (Red-team verdict on lr/KL to be folded.)
+#
+# ** per_device_train_batch_size MUST be 1 ** (head reads the literal last token; bs>1 right-pads).
+# ** LAUNCH WITH rl.sh -> rl/train_head_pg.py — NOT `swift sft`. NPROC_PER_NODE=8, ga16. **
+
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-225
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz
+  HPG_OBJECTIVE: 'reinforce'        # the RL (head-PG REINFORCE), NOT rank_sft
+  HPG_REWARD: 'crossad'             # cross-ad pairwise concordance vs running buffer (cosine +0.59)
+  HPG_FREEZE_BACKBONE: '0'          # full-FT (reshape backbone); zero3 partitions cleanly
+  HPG_G: '16'                       # rollouts/ad (share 1 forward)
+  HPG_SIGMA: '0.3'                  # exploration std
+  HPG_KL: '0.03'                    # trust-region to frozen SFT head (protects ckpt-225)
+  HPG_BETA: '50.0'                  # concordance sharpness (gate +0.64)
+  HPG_MARGIN: '0.05'                # drop near-tie pairs (large-margin -> generalizes; run-4)
+  HPG_TLO: '1'
+  HPG_THI: '30'
+  HPG_BUF: '512'                    # bigger buffer (compensate fewer GPUs vs 16-card) -> less-noisy cross-ad estimate
+  HPG_BUF_MIN: '64'                 # warmup-skip: zero advantage until buffer warm
+  HPG_CLIP: '1.0'
+
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+deepspeed: zero3
+
+num_train_epochs: 2                 # ~560 steps at eff-batch 128 (10x the morning's ~75). Extend if SRCC climbing.
+learning_rate: 1.0e-6
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16     # 1 * 16 * 8 GPUs = eff-batch 128 (MATCHES 16-card baseline)
+
+logging_steps: 1
+eval_strategy: 'no'                 # per-ckpt SRCC tracked out-of-loop on the fixed eval box
+save_steps: 25
+save_total_limit: 60                # save-all (~22 ckpts over 2 epochs) for best-ckpt selection
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/rl_head_pg_proper
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

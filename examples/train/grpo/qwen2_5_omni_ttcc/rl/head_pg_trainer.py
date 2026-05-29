@@ -94,6 +94,12 @@ class HeadPGTrainer(Seq2SeqTrainer):
         #     running buffer of recent ads (fixes Bug A: the within-ad advantage now carries
         #     cross-ad order; cosine-gate +0.59 vs the SRCC direction). 'rrank' = run-1's
         #     per-ad percentile-match calibration reward (cosine 0.0 -> dead; kept for A/B). ---
+        # OBJECTIVE: 'reinforce' (head-PG RL, runs 1-4) or 'rank_sft' (Step-1 SUPERVISED
+        # differentiable cross-ad pairwise-rank loss on r_pred -> reshapes head+backbone with a
+        # DENSE gradient; the effective tool to LEARN features since we have labels). rank_sft uses
+        # the same cross-ad buffer but a BPR/logistic loss (no rollouts, no REINFORCE).
+        self.objective = os.environ.get('HPG_OBJECTIVE', 'reinforce').lower()
+        self.alpha_mse = float(os.environ.get('HPG_ALPHA_MSE', '0.1'))   # rank_sft: small MSE calibration anchor
         self.reward_mode = os.environ.get('HPG_REWARD', 'crossad').lower()
         self.beta = float(os.environ.get('HPG_BETA', '10.0'))         # concordance sigmoid sharpness
         self.margin = float(os.environ.get('HPG_MARGIN', '0.0'))      # run-4: drop pairs with |true gap|<margin (large-margin -> generalizes)
@@ -197,6 +203,11 @@ class HeadPGTrainer(Seq2SeqTrainer):
             assert mono, 'SELF-CHECK FAILED: R_true not monotone — r_true layout assumption (A3) wrong.'
             self._selfcheck_done = True
 
+        # --- STEP-1: SUPERVISED differentiable cross-ad pairwise-rank loss (no rollouts).
+        #     r_pred is grad-connected -> this reshapes head+backbone with a DENSE gradient. ---
+        if self.objective == 'rank_sft':
+            return self._rank_sft_loss(r_pred, R_true_list, B, Tmax, outputs, return_outputs)
+
         # --- 4. MATH: head-PG REINFORCE (all reward/adv/action detached) ---
         G, sigma = self.G, self.sigma
         mu_rep = mu_z.unsqueeze(1).expand(B, G, Tmax)                 # shares the ONE forward graph
@@ -265,6 +276,50 @@ class HeadPGTrainer(Seq2SeqTrainer):
                 curve_tail=float(mean_curve[:, tail_idx].mean()),      # mean policy R(t_hi)
                 buf=float(len(self._buffer)),                          # cross-ad buffer fill (run-2)
             )
+        return (loss, outputs) if return_outputs else loss
+
+    def _rank_sft_loss(self, r_pred, R_true_list, B, Tmax, outputs, return_outputs):
+        """SUPERVISED cross-ad pairwise-rank (BPR/logistic) loss + small MSE calibration.
+        For ad A (r_pred grad-connected, = R(1..Tmax)) vs a detached buffer of recent ads:
+          loss_rank = mean over valid (t, buffer-ad B) of  -log sigma( beta*(R_A(t)-R_B(t))*sign(R^true_A(t)-R^true_B(t)) )
+          only pairs with |true gap| >= margin (large-margin -> generalizes).
+        Gradient flows through R_A(t) -> head -> backbone (DENSE; reshapes features)."""
+        import torch.nn.functional as F
+        dev = r_pred.device
+        tlo, thi, margin, beta = self.t_lo, self.t_hi, self.margin, self.beta
+        rank_terms, mse_terms = [], []
+        if len(self._buffer) >= self.buf_min:
+            Pbuf = torch.as_tensor(np.stack([x[0] for x in self._buffer]), device=dev, dtype=torch.float32)  # (M,Tmax) R(1..Tmax)
+            Tbuf = torch.as_tensor(np.stack([x[1] for x in self._buffer]), device=dev, dtype=torch.float32)  # (M,Tmax+1) R(0..Tmax) padded
+            Tlen = torch.as_tensor([x[2] for x in self._buffer], device=dev)                                 # (M,) true length
+            for b in range(B):
+                ta = R_true_list[b]; Tb = len(ta) - 1
+                hi = min(thi, Tb)
+                if hi < tlo:
+                    continue
+                tt = torch.arange(tlo, hi + 1, device=dev)                       # seconds (nt,)
+                pa_t = r_pred[b].float()[tt - 1]                                  # R_A(t) grad (nt,)
+                ta_t = torch.as_tensor([ta[int(t)] for t in tt], device=dev, dtype=torch.float32)
+                gap = ta_t[None, :] - Tbuf[:, tt]                                 # (M, nt)
+                s = torch.sign(gap)
+                diff = beta * (pa_t[None, :] - Pbuf[:, tt - 1]) * s              # (M, nt) grad
+                valid = (gap.abs() >= margin) & (Tlen[:, None] >= tt[None, :])    # drop near-ties + invalid t
+                if valid.any():
+                    rank_terms.append(-F.logsigmoid(diff[valid]).mean())
+                mse_terms.append(((pa_t - ta_t) ** 2).mean())                     # calibration anchor
+        # push this ad's prediction + true curve into the buffer (after scoring)
+        for b in range(B):
+            ta = R_true_list[b]; Tb = len(ta) - 1
+            tp = np.zeros(Tmax + 1, dtype=np.float32)
+            tp[:min(len(ta), Tmax + 1)] = np.asarray(ta[:Tmax + 1], dtype=np.float32)
+            self._buffer.append((r_pred[b].detach().float().cpu().numpy(), tp, Tb))
+        loss_rank = torch.stack(rank_terms).mean() if rank_terms else r_pred.sum() * 0.0   # warmup: ~0 update
+        loss_mse = torch.stack(mse_terms).mean() if mse_terms else r_pred.sum() * 0.0
+        loss = loss_rank + self.alpha_mse * loss_mse
+        with torch.no_grad():
+            self._log(rank_loss=float(loss_rank.detach()), mse_loss=float(loss_mse.detach()),
+                      buf=float(len(self._buffer)), npairs=float(len(rank_terms)),
+                      pred_spread=float(r_pred.detach().float().std()))
         return (loss, outputs) if return_outputs else loss
 
     def _log(self, **kv):

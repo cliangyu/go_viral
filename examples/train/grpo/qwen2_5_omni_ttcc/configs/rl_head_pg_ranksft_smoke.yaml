@@ -1,0 +1,67 @@
+# SMOKE for rl_head_pg_ranksft.yaml — 2 CARDS, ~5 steps. Validates the rank_sft path under the
+# REAL distributed topology (ZeRO-3 partition/gather + DDP grad-sync) that 1 GPU cannot reach.
+# PASS criteria (all must hold) — see RL_INVESTIGATION_LOG / launch notes:
+#   1. both ranks load ckpt-225 under ZeRO-3, no OOM
+#   2. SELF-CHECK on both ranks: max|mu_z->curve - forward r_pred| < 1e-3 AND R_true monotone
+#   3. KL-ref capture under ZeRO-3: GatheredParameters yields full W(2048) (no "size mismatch vec(0)")
+#   4. rank loss real: hpg_rank_loss>0, npairs>0, finite (no NaN/Inf); pred_spread>0
+#   5. backward+step succeed on both ranks (no unused-param / no cross-rank hang); grad_norm finite
+#   6. checkpoint saves AND reloads under ZeRO-3 (save at step 5; reload-check after)
+# Launch (2 cards): CUDA_VISIBLE_DEVICES=0,1 NPROC=2 bash rl.sh configs/rl_head_pg_ranksft_smoke.yaml
+
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-225
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz
+  HPG_OBJECTIVE: 'rank_sft'
+  HPG_FREEZE_BACKBONE: '0'
+  HPG_ALPHA_MSE: '0.1'
+  HPG_BETA: '50.0'
+  HPG_MARGIN: '0.05'
+  HPG_TLO: '1'
+  HPG_THI: '30'
+  HPG_BUF: '256'
+  HPG_BUF_MIN: '2'                  # SMOKE: rank loss fires after 2 ads (prod=64)
+
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+deepspeed: zero3
+
+max_steps: 5                        # SMOKE: stop after 5 optimizer steps
+learning_rate: 5.0e-6
+warmup_ratio: 0.0
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2      # 5 steps * 2 accum * 2 ranks = 20 ads (fills buf_min=2 fast)
+
+logging_steps: 1
+eval_strategy: 'no'
+save_steps: 5                       # SMOKE: save once at the last step -> reload-check ckpt integrity
+save_total_limit: 1
+report_to: tensorboard              # local only (no wandb auth/noise); '[]' is an argparse error
+output_dir: /tmp/ranksft_smoke
+
+dataloader_num_workers: 2
+dataloader_persistent_workers: false
+dataloader_prefetch_factor: 2
