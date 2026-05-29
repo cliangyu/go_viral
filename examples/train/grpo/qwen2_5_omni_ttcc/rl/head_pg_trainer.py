@@ -1,0 +1,191 @@
+#!/usr/bin/env python
+"""Head-PG REINFORCE RL trainer for the Qwen2.5-Omni retention head, as a
+ms-swift `Seq2SeqTrainer` subclass (override `compute_loss`). Wired in via
+`rl_register.py` (external_plugin) which points TrainerFactory at this class —
+NO swift-core edits, NO register.py edits. See NORTH_STAR §10.
+
+THE FOUR DETAILS (Leon: "the devil is in the details"):
+
+1. CONFIGURATIONS (env, prefix HPG_): G=rollouts/ad (memory-free, share 1 forward);
+   SIGMA=hazard exploration std (calibrated 0.2, smoke); KL=trust-region coef to the
+   frozen SFT head; CLIP=grad-norm; T_LO..T_HI=reward seconds [1,30]; CDF=train-only
+   percentile npz; FREEZE_BACKBONE=1 for run-1 (head-only, KL-to-SFT-head EXACT).
+   ** per_device_train_batch_size MUST be 1 ** (see assumption A2) — asserted.
+
+2. ASSUMPTIONS (verified, not guessed):
+   A1. h_anchor = h_last[:, -1] (the LITERAL last token). register._locate_anchor_positions
+       returns L-1 when the </cot> matcher misses (it always does — dead anchor), in
+       training AND eval. So the head's input IS the last column.
+   A2. With bs=1 there is NO intra-batch padding, so column L-1 == the real last token
+       == exactly what eval (eval_ibs bypass, also bs=1) reads. bs>1 would right-pad and
+       L-1 could be a PAD hidden -> train/eval mismatch. Hence bs MUST be 1.
+   A3. holder.r_true is R(1..Tmax) aligned with r_pred=R(1..Tmax); r_mask marks valid
+       seconds; the true curve is [1.0] + r_true[:T]. (Same layout RetentionLoss MSEs.)
+   A4. reward / advantage / sampled action are DETACHED; gradient flows ONLY through
+       logpi(z'|mu_z) (REINFORCE) and the KL(mu_z||mu_ref) term -> via mu_z = head.linear(h).
+   ** SELF-CHECK on first batch: curve_from_hazards(mu_z)[:,1:] ≈ holder.r_pred **
+   proves A1/A2 (my mu_z == the forward's head input). Aborts on mismatch.
+
+3. NAMINGS: HPG_* env, head_pg_trainer / rl_register / rl_head_pg.yaml / ttcc_train_bypass.jsonl.
+4. MATH: identical to the unit-tested reinforce_core + head_pg_compute_loss + the passed
+   GPU smoke. z'=mu_z+sigma*eps; curve=exp(-cumsum(softplus(z'))); A=(r-mean)/std within
+   the ad's G rollouts; loss = -(logpi*A).mean() + KL*coef; KL=((mu_z-mu_ref)^2/(2 sigma^2)).sum.
+"""
+from __future__ import annotations
+import os
+import sys
+
+import numpy as np
+import torch
+
+# verified RL components are the SINGLE source in ../verification (unit-tested + smoke).
+# Import them from there so there is no duplicated copy to drift.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VERIF = os.path.normpath(os.path.join(_HERE, '..', 'verification'))
+for _p in (_VERIF, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import cross_ad_reward as CAR          # Gate-1 verified reward (../verification)
+import reinforce_core as RC            # Gate-2 verified REINFORCE math (../verification)
+
+from swift.trainers import Seq2SeqTrainer
+from swift.utils import get_logger
+
+logger = get_logger()
+
+# --- 1. CONFIGURATIONS (env) ---
+G = int(os.environ.get('HPG_G', '16'))
+SIGMA = float(os.environ.get('HPG_SIGMA', '0.2'))
+KL_COEF = float(os.environ.get('HPG_KL', '0.04'))
+CLIP = float(os.environ.get('HPG_CLIP', '1.0'))
+T_LO = int(os.environ.get('HPG_TLO', '1'))
+T_HI = int(os.environ.get('HPG_THI', '30'))
+CDF_PATH = os.environ.get('HPG_CDF', '')
+FREEZE_BACKBONE = os.environ.get('HPG_FREEZE_BACKBONE', '1') == '1'
+
+
+def load_cdf(path):
+    z = np.load(path, allow_pickle=True)
+    out = {}
+    for k in z.keys():
+        kk = k[1:] if k.startswith('t') else k
+        out[int(kk)] = np.asarray(z[k])
+    return out
+
+
+def reward_fn(R_hat, R_true, cdf, t_lo=1, t_hi=30):
+    return [CAR.r_rank(rh, rt, cdf, t_lo, t_hi) for rh, rt in zip(R_hat, R_true)]
+
+
+class HeadPGTrainer(Seq2SeqTrainer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert CDF_PATH and os.path.exists(CDF_PATH), f'HPG_CDF missing/not found: {CDF_PATH!r}'
+        # A2: bs MUST be 1 so the last column is the real last token (== eval).
+        bs = getattr(self.args, 'per_device_train_batch_size', 1)
+        assert bs == 1, (f'HeadPGTrainer requires per_device_train_batch_size=1 '
+                         f'(got {bs}); bs>1 right-pads -> h_anchor at L-1 becomes a PAD '
+                         f'hidden and mismatches eval. Use grad_accum / more GPUs to scale.')
+        self._cdf = load_cdf(CDF_PATH)
+        base = self._base()
+        if FREEZE_BACKBONE:
+            n_train = 0
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+            for p in base.retention_head.linear.parameters():
+                p.requires_grad_(True); n_train += p.numel()
+            logger.info(f'[head-pg] FREEZE_BACKBONE: only retention_head.linear trains ({n_train} params)')
+        # KL reference = frozen SFT head (exact when backbone frozen; approx otherwise)
+        self._ref_W = base.retention_head.linear.weight.detach().clone()
+        self._ref_b = base.retention_head.linear.bias.detach().clone()
+        self._selfcheck_done = False
+        logger.info(f'[head-pg] G={G} sigma={SIGMA} kl={KL_COEF} clip={CLIP} '
+                    f't=[{T_LO},{T_HI}] freeze_backbone={FREEZE_BACKBONE}')
+
+    def _base(self):
+        m = self.accelerator.unwrap_model(self.model)
+        m = getattr(m, 'base_model', m)
+        m = getattr(m, 'model', m)
+        return m
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # swift's base compute_loss pops these non-model keys before model(**inputs);
+        # we override compute_loss so we must pop them too (else the Qwen forward sees
+        # unexpected kwargs). We use no LM labels in RL (reward is the only objective).
+        for k in ('compute_loss_func', 'loss_scale', 'text_position_ids', 'channel', 'labels'):
+            inputs.pop(k, None)
+        outputs = model(**inputs)                      # patched forward -> holder.{last,r_pred,r_true,r_mask}
+        base = self._base()
+        holder = base._retention_h_holder
+        head = base.retention_head
+        h_last = holder.last                           # (B, L, d); requires grad iff backbone trainable
+        B = h_last.size(0)
+        # A1: literal last token (matches register's dead-anchor fallback L-1).
+        h_anchor = h_last[:, -1, :]                    # (B, d)
+        w_dtype = head.linear.weight.dtype
+        mu_z = head.linear(h_anchor.to(w_dtype)).float()   # (B, Tmax)  == the forward's head input
+        Tmax = mu_z.size(1)
+
+        # A3: reconstruct true curves R(0..T) from holder
+        r_true = holder.r_true.float()
+        r_mask = holder.r_mask
+        R_true_list = []
+        for b in range(B):
+            Tb = int(r_mask[b].sum().item())
+            R_true_list.append([1.0] + r_true[b, :Tb].tolist())
+
+        # SELF-CHECK (once): my mu_z must reproduce the forward's r_pred.
+        if not self._selfcheck_done:
+            with torch.no_grad():
+                recon = RC.curve_from_hazards(mu_z)[:, 1:]      # (B, Tmax) = R(1..Tmax)
+                rp = holder.r_pred.float()
+                md = float((recon - rp).abs().max())
+            ok = md < 1e-3
+            mono = all(all(R_true_list[b][i] >= R_true_list[b][i + 1] - 1e-6
+                           for i in range(len(R_true_list[b]) - 1)) for b in range(B))
+            logger.info(f'[head-pg] SELF-CHECK mu_z->curve vs forward r_pred max|Δ|={md:.2e} '
+                        f'({"OK" if ok else "MISMATCH"}); R_true monotone={mono}; '
+                        f'B={B} Tmax={Tmax} T0={len(R_true_list[0])-1}')
+            assert ok, ('SELF-CHECK FAILED: recomputed mu_z does not match the forward head '
+                        '(wrong anchor token or dtype). Refusing to train on a wrong signal.')
+            assert mono, 'SELF-CHECK FAILED: R_true not monotone — r_true layout assumption (A3) wrong.'
+            self._selfcheck_done = True
+
+        # --- 4. MATH: head-PG REINFORCE (all reward/adv/action detached) ---
+        mu_rep = mu_z.unsqueeze(1).expand(B, G, Tmax)                 # shares the ONE forward graph
+        eps = torch.randn(B, G, Tmax, device=mu_z.device)
+        z = (mu_rep + SIGMA * eps).detach()                          # action, detached
+        curves = RC.curve_from_hazards(z.view(B * G, Tmax))          # (B*G, Tmax+1)
+        Rh = [curves[i].tolist() for i in range(B * G)]
+        Rt = [R_true_list[b] for b in range(B) for _ in range(G)]
+        rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, T_LO, T_HI),
+                              dtype=torch.float32, device=mu_z.device).view(B, G)
+        adv = (rew - rew.mean(dim=1, keepdim=True)) / (rew.std(dim=1, keepdim=True) + 1e-6)
+        adv = adv.view(-1).detach()
+        logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), SIGMA)
+        pg = -(logp * adv).mean()
+        # KL to frozen SFT head (computed on the CURRENT h_anchor)
+        mu_ref = (h_anchor.to(w_dtype) @ self._ref_W.t().to(w_dtype)
+                  + self._ref_b.to(w_dtype)).float().detach()
+        kl = (((mu_z - mu_ref) ** 2) / (2 * SIGMA ** 2)).sum(dim=-1).mean()
+        loss = pg + KL_COEF * kl
+
+        # log (best-effort, swift custom_metrics + holder fallback)
+        self._log(reward=float(rew.mean()), within_grp_std=float(rew.std(dim=1).mean()),
+                  pg=float(pg.detach()), kl=float(kl.detach()), adv_abs=float(adv.abs().mean()))
+        return (loss, outputs) if return_outputs else loss
+
+    def _log(self, **kv):
+        try:
+            mode = 'train' if self.model.training else 'eval'
+            for k, v in kv.items():
+                self.custom_metrics[mode][f'hpg_{k}'].update(v)
+        except Exception:
+            pass
+
+    def create_optimizer(self):
+        # grad-clip is applied by HF Trainer via max_grad_norm; set it from CLIP.
+        if getattr(self.args, 'max_grad_norm', None) in (None, 0) or self.args.max_grad_norm != CLIP:
+            self.args.max_grad_norm = CLIP
+        return super().create_optimizer()
