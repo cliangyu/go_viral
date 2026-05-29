@@ -34,6 +34,7 @@ THE FOUR DETAILS (Leon: "the devil is in the details"):
 from __future__ import annotations
 import os
 import sys
+from collections import deque
 
 import numpy as np
 import torch
@@ -45,7 +46,8 @@ _VERIF = os.path.normpath(os.path.join(_HERE, '..', 'verification'))
 for _p in (_VERIF, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-import cross_ad_reward as CAR          # Gate-1 verified reward (../verification)
+import cross_ad_reward as CAR          # Gate-1 verified reward (../verification) — run-1 (per-ad calibration)
+import cross_ad_rank_reward as CARR    # run-2 reward: cross-ad concordance (cosine gate +0.59 vs SRCC dir)
 import reinforce_core as RC            # Gate-2 verified REINFORCE math (../verification)
 
 from swift.trainers import Seq2SeqTrainer
@@ -88,6 +90,15 @@ class HeadPGTrainer(Seq2SeqTrainer):
         self.t_lo = int(os.environ.get('HPG_TLO', '1'))
         self.t_hi = int(os.environ.get('HPG_THI', '30'))
         self.freeze_backbone = os.environ.get('HPG_FREEZE_BACKBONE', '1') == '1'
+        # --- REWARD MODE (run-2): 'crossad' = cross-ad ranking concordance vs a detached
+        #     running buffer of recent ads (fixes Bug A: the within-ad advantage now carries
+        #     cross-ad order; cosine-gate +0.59 vs the SRCC direction). 'rrank' = run-1's
+        #     per-ad percentile-match calibration reward (cosine 0.0 -> dead; kept for A/B). ---
+        self.reward_mode = os.environ.get('HPG_REWARD', 'crossad').lower()
+        self.beta = float(os.environ.get('HPG_BETA', '10.0'))         # concordance sigmoid sharpness
+        self.buf_cap = int(os.environ.get('HPG_BUF', '256'))          # per-GPU FIFO of recent ads
+        self.buf_min = int(os.environ.get('HPG_BUF_MIN', '8'))        # warmup: below this, low signal
+        self._buffer = deque(maxlen=self.buf_cap)                     # [(pred_mean_curve, true_curve)]
         cdf_path = os.environ.get('HPG_CDF', '')
         assert cdf_path and os.path.exists(cdf_path), f'HPG_CDF missing/not found: {cdf_path!r}'
         # A2: bs MUST be 1 so the last column is the real last token (== eval).
@@ -191,10 +202,28 @@ class HeadPGTrainer(Seq2SeqTrainer):
         eps = torch.randn(B, G, Tmax, device=mu_z.device)
         z = (mu_rep + sigma * eps).detach()                          # action, detached
         curves = RC.curve_from_hazards(z.view(B * G, Tmax))          # (B*G, Tmax+1)
-        Rh = [curves[i].tolist() for i in range(B * G)]
-        Rt = [R_true_list[b] for b in range(B) for _ in range(G)]
-        rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, self.t_lo, self.t_hi),
-                              dtype=torch.float32, device=mu_z.device).view(B, G)
+        if self.reward_mode == 'crossad':
+            # cross-ad RANKING reward (run-2): score each rollout by pairwise concordance vs a
+            # detached running buffer of OTHER ads (policy-mean curve + true curve). The within-ad
+            # advantage then encodes "which rollout ranks THIS ad correctly vs the population" ->
+            # a real cross-ad SRCC gradient through the SAME REINFORCE path. cosine-gate=+0.59.
+            with torch.no_grad():
+                mean_curves = RC.curve_from_hazards(mu_z)            # (B, Tmax+1) policy-mean refs
+            buf_pred = [c for (c, _) in self._buffer]
+            buf_true = [tc for (_, tc) in self._buffer]
+            rew_rows = []
+            for b in range(B):
+                rollouts_b = [curves[b * G + g].tolist() for g in range(G)]
+                rew_rows.append(CARR.crossad_rank_reward(
+                    rollouts_b, R_true_list[b], buf_pred, buf_true,
+                    t_lo=self.t_lo, t_hi=self.t_hi, beta=self.beta))
+                self._buffer.append((mean_curves[b].tolist(), R_true_list[b]))  # add AFTER scoring
+            rew = torch.as_tensor(np.stack(rew_rows), dtype=torch.float32, device=mu_z.device).view(B, G)
+        else:  # 'rrank' — run-1 per-ad percentile-match calibration reward (A/B / fallback)
+            Rh = [curves[i].tolist() for i in range(B * G)]
+            Rt = [R_true_list[b] for b in range(B) for _ in range(G)]
+            rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, self.t_lo, self.t_hi),
+                                  dtype=torch.float32, device=mu_z.device).view(B, G)
         adv = (rew - rew.mean(dim=1, keepdim=True)) / (rew.std(dim=1, keepdim=True) + 1e-6)
         adv = adv.view(-1).detach()
         logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), sigma)
@@ -228,6 +257,7 @@ class HeadPGTrainer(Seq2SeqTrainer):
                 muz_absmean=float(mu_z.detach().abs().mean()),
                 muz_max=float(mu_z.detach().abs().max()),
                 curve_tail=float(mean_curve[:, tail_idx].mean()),      # mean policy R(t_hi)
+                buf=float(len(self._buffer)),                          # cross-ad buffer fill (run-2)
             )
         return (loss, outputs) if return_outputs else loss
 
