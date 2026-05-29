@@ -108,6 +108,15 @@ class HeadPGTrainer(Seq2SeqTrainer):
         self._z_cap = {}
         base.retention_head.linear.register_forward_hook(
             lambda _m, _inp, out: self._z_cap.__setitem__('z', out))
+        # Detach the head's curve output (r_pred): the softplus->cumsum->exp branch is a
+        # SECOND autograd consumer of head.linear's output z in the same step, which makes
+        # the DDP Reducer raise "Expected to mark a variable ready only once". The RL loss
+        # only needs z (captured above); r_pred is unused. Returning out.detach() from a
+        # forward-hook on the head module removes that branch -> head.linear is single-use
+        # -> plain DDP works at ANY gradient_accumulation_steps (no static_graph needed,
+        # avoids the static_graph+grad_accum>1 bug accelerate#3679). Values unchanged (the
+        # self-check still compares curve magnitudes); only the dangling gradient path is cut.
+        base.retention_head.register_forward_hook(lambda _m, _inp, out: out.detach())
         self._selfcheck_done = False
         logger.info(f'[head-pg] G={self.G} sigma={self.sigma} kl={self.kl_coef} clip={self.clip} '
                     f't=[{self.t_lo},{self.t_hi}] freeze_backbone={self.freeze_backbone}')
