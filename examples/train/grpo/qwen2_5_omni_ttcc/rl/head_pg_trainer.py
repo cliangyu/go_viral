@@ -104,9 +104,20 @@ class HeadPGTrainer(Seq2SeqTrainer):
             for p in base.retention_head.linear.parameters():
                 p.requires_grad_(True); n_train += p.numel()
             logger.info(f'[head-pg] FREEZE_BACKBONE: only retention_head.linear trains ({n_train} params)')
-        # KL reference = frozen SFT head (exact when backbone frozen; approx otherwise)
-        self._ref_W = base.retention_head.linear.weight.detach().clone()
-        self._ref_b = base.retention_head.linear.bias.detach().clone()
+        # KL reference = frozen SFT head. Under ZeRO-3 the live head.linear weight is
+        # PARTITIONED (size 0 on non-owner ranks), so a plain .clone() yields an empty shard
+        # and the KL matmul fails ("size mismatch ... vec (0)"). Gather the full param first
+        # (deepspeed.zero.GatheredParameters is a no-op when the param isn't ZeRO-3-sharded).
+        _lin = base.retention_head.linear
+        try:
+            import deepspeed
+            with deepspeed.zero.GatheredParameters([_lin.weight, _lin.bias], modifier_rank=None):
+                self._ref_W = _lin.weight.detach().float().clone()
+                self._ref_b = _lin.bias.detach().float().clone()
+        except Exception:
+            self._ref_W = _lin.weight.detach().float().clone()
+            self._ref_b = _lin.bias.detach().float().clone()
+        logger.info(f'[head-pg] KL ref captured: W{tuple(self._ref_W.shape)} b{tuple(self._ref_b.shape)}')
         # Capture the head's pre-activation z from the forward's SINGLE head.linear call.
         # Recomputing mu_z = head.linear(h_anchor) in compute_loss would be a SECOND use of
         # head.linear in the same step -> under DDP the reducer raises "Expected to mark a
