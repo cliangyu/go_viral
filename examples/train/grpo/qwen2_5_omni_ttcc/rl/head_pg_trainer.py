@@ -174,9 +174,28 @@ class HeadPGTrainer(Seq2SeqTrainer):
         kl = (((mu_z - mu_ref) ** 2) / (2 * sigma ** 2)).sum(dim=-1).mean()
         loss = pg + self.kl_coef * kl
 
-        # log (best-effort, swift custom_metrics + holder fallback)
-        self._log(reward=float(rew.mean()), within_grp_std=float(rew.std(dim=1).mean()),
-                  pg=float(pg.detach()), kl=float(kl.detach()), adv_abs=float(adv.abs().mean()))
+        # --- OBSERVABILITY: log every signal needed to debug RL failure modes ---
+        # (lesson from SFT: we had 2 losses but logged only the total -> painful to debug.
+        #  here we log both loss components AND the detectors for each known failure mode.)
+        with torch.no_grad():
+            wg = rew.std(dim=1)                                         # per-ad within-group std
+            mean_curve = RC.curve_from_hazards(mu_z.detach())          # (B, Tmax+1) policy-MEAN curve
+            tail_idx = min(self.t_hi, mean_curve.size(1) - 1)
+            self._log(
+                # loss components (the SFT lesson: never hide sub-losses)
+                pg=float(pg.detach()), kl=float(kl.detach()),
+                # reward distribution (saturation / range)
+                reward=float(rew.mean()), reward_min=float(rew.min()), reward_max=float(rew.max()),
+                # R1 collapse detector: variance in the rank dimension (make-or-break)
+                within_grp_std=float(wg.mean()),
+                dead_grp_frac=float((wg < 1e-4).float().mean()),       # frac of ads with no signal
+                # advantage health
+                adv_abs=float(adv.abs().mean()),
+                # head/policy health: hazard scale + curve tail (detect saturation -> collapse)
+                muz_absmean=float(mu_z.detach().abs().mean()),
+                muz_max=float(mu_z.detach().abs().max()),
+                curve_tail=float(mean_curve[:, tail_idx].mean()),      # mean policy R(t_hi)
+            )
         return (loss, outputs) if return_outputs else loss
 
     def _log(self, **kv):
