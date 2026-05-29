@@ -32,15 +32,18 @@ Usage
 -----
     # 0) one-time: pull the parquet (train+val; you do NOT need test-*)
     hf download liangyuch/ttcc-v0_2_0 --repo-type dataset \
-        --include 'data/train-*.parquet' 'data/val-*.parquet' --local-dir /vol/data/hf_ttcc
+        --include 'data/train-*.parquet' --include 'data/val-*.parquet' --local-dir /vol/data/hf_ttcc
 
     # 1) train split (with CoT)
     python make_v8_from_hf.py --split train \
         --hf-ttcc-dir /vol/data/hf_ttcc --video-dir /vol/data/videos \
         --out-jsonl /vol/data/ttcc_v8/ttcc_train_with_cot.jsonl
 
-    # 2) val split (no CoT; cap to 200 to mirror val_200_no_cot.jsonl)
-    python make_v8_from_hf.py --split val --no-cot --limit 200 \
+    # 2) val split (no CoT). Omit --limit for the FULL val split.
+    #    NOTE: --limit N takes the first N val ads in shard order; it does NOT reproduce the
+    #    exact historical val_200_no_cot.jsonl ad_id set. For an apples-to-apples comparison
+    #    against our 0.5142, filter to our 200 ad_ids (ask us for the allowlist) instead of --limit.
+    python make_v8_from_hf.py --split val --no-cot \
         --hf-ttcc-dir /vol/data/hf_ttcc --video-dir /vol/data/videos \
         --out-jsonl /vol/data/ttcc_holdout/val_200_no_cot.jsonl
 
@@ -167,7 +170,7 @@ def main() -> int:
             t = pq.read_table(shard, columns=cols).to_pandas()
             t = t[t["split"] == args.split]
             for _, row in t.iterrows():
-                if args.limit and n >= args.limit:
+                if args.limit is not None and n >= args.limit:
                     break
                 raw = row["retention_curve"]
                 if raw is None or len(raw) == 0:
@@ -195,7 +198,7 @@ def main() -> int:
                         drops["leak"] += 1; continue
 
                 mp4 = args.video_dir / f"{ad_id}.mp4"
-                if not mp4.exists():
+                if not mp4.exists() or mp4.stat().st_size != len(vb):   # re-write stale/partial mp4
                     mp4.write_bytes(bytes(vb))
 
                 fout.write(json.dumps({
@@ -213,7 +216,7 @@ def main() -> int:
                 n += 1
                 if n % 1000 == 0:
                     print(f"  ... wrote {n}")
-            if args.limit and n >= args.limit:
+            if args.limit is not None and n >= args.limit:
                 break
 
     print(f"\nwrote {n} rows -> {args.out_jsonl}")

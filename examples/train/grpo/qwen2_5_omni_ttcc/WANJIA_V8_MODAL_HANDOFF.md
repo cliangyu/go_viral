@@ -36,7 +36,7 @@ Script: **`examples/custom/qwen2_5_omni_retention/tools/make_v8_from_hf.py`** (i
 ```bash
 # 0) pull the parquet (train + val; you do NOT need test-*). Large — embedded video bytes.
 hf download liangyuch/ttcc-v0_2_0 --repo-type dataset \
-    --include 'data/train-*.parquet' 'data/val-*.parquet' --local-dir /vol/data/hf_ttcc
+    --include 'data/train-*.parquet' --include 'data/val-*.parquet' --local-dir /vol/data/hf_ttcc
 
 # 1) TRAIN split (joins ttcc-cot's <cot>; extracts <ad_id>.mp4 into --video-dir)
 python examples/custom/qwen2_5_omni_retention/tools/make_v8_from_hf.py --split train \
