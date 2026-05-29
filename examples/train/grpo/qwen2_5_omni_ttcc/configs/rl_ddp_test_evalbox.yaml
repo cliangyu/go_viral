@@ -32,8 +32,8 @@ remove_unused_columns: false
 tuner_type: full
 freeze_vit: true
 freeze_aligner: true
-gradient_checkpointing: false       # eval-box test (96GB) does not need it; cluster may enable
-vit_gradient_checkpointing: false
+gradient_checkpointing: true        # full-FT 3B+Adam needs it for activations (SFT uses it too)
+vit_gradient_checkpointing: true
 torch_compile: false
 # deepspeed: (none) -> plain DDP; 3B full-FT fits one 80GB GPU, no sharding needed
 
