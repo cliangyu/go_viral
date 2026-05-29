@@ -59,7 +59,8 @@ class HeadPGSft(SwiftSft):
 
 
 def main():
-    return HeadPGSft().main()      # SwiftSft.__init__(None) parses sys.argv, like the swift CLI
+    # Pass argv explicitly (sft_main's documented List[str] path): [<config.yaml>, --override ...]
+    return HeadPGSft(sys.argv[1:]).main()
 
 
 if __name__ == '__main__':
