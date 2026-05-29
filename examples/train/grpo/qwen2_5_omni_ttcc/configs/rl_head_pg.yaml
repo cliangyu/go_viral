@@ -22,7 +22,7 @@
 # NOTE: no `loss_type` — HeadPGTrainer.compute_loss fully overrides the loss
 # (the swift-injected compute_loss_func is popped, never used).
 
-model: /opt/dlami/nvme/v8_eval/ckpt-150          # init RL from the SFT checkpoint (override per cluster)
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-150  # SFT ckpt-150 on the 2x8 cluster (us-east-2)
 torch_dtype: bfloat16
 attn_impl: flash_attn
 
@@ -32,7 +32,7 @@ model_type: qwen2_5_omni_retention
 
 ENV:
   RETENTION_HEAD_TYPE: hazard
-  HPG_CDF: /opt/dlami/nvme/v8_eval/rl/train_cdf.npz
+  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # built on cluster (build_cdf, val-disjoint verified)
   HPG_G: '16'
   HPG_SIGMA: '0.2'
   HPG_KL: '0.04'
@@ -41,7 +41,7 @@ ENV:
   HPG_THI: '30'
   HPG_FREEZE_BACKBONE: '1'
 
-dataset: /opt/dlami/nvme/v8_eval/data/ttcc_train_bypass.jsonl   # assistant=<cot></cot>, video+R
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl   # assistant=<cot></cot>, video+R (built on cluster)
 max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
