@@ -1,30 +1,24 @@
-# RL V1 — head-PG REINFORCE on the retention head (cross-ad ranking reward).
+# RL PRODUCTION (option B) — head-PG REINFORCE on the retention head, full fine-tune + ZeRO-3.
 #
-# Policy = diagonal Gaussian on the head's hazard logits z=linear(h_last);
-# action z'=z+sigma*eps; curve=exp(-cumsum(softplus(z'))); reward = cross-ad
-# percentile-rank vs the train-only CDF; advantage = within-ad group-relative;
-# loss = -(logpi*A) + KL to the frozen SFT head. Implemented in
-# rl/head_pg_trainer.py (Seq2SeqTrainer.compute_loss override).
+# Policy = diagonal Gaussian on the head's hazard logits z; action z'=z+sigma*eps;
+# curve=exp(-cumsum(softplus(z'))); reward = cross-ad percentile-rank vs the train-only CDF;
+# advantage = within-ad group-relative; loss = -(logpi*A) + KL to the frozen SFT head.
+# mu_z is DERIVED from the model OUTPUT r_pred (softplus^-1(-Δlog R)) so the backward flows the
+# standard path ZeRO-3/DDP instrument — exactly like GRPO from logits (rl/head_pg_trainer.py).
 #
-# ** LAUNCH WITH rl/train_head_pg.py — NOT `swift sft`. ** This is RL; the entry
-# subclasses SwiftSft for its mechanics (one forward + custom loss) and swaps in
-# HeadPGTrainer. See NORTH_STAR §10. external_plugins loads only register.py
-# (model_type/template/forward); the trainer is selected by the entry, not the factory.
+# ** LAUNCH WITH rl.sh -> rl/train_head_pg.py — NOT `swift sft`. ** Multi-node: use the EFA
+# launcher (launch_rl_2node.sh) with MASTER_PORT!=29500 (SFT holds 29500). See RL_LAUNCH_BLOCKERS.md.
 #
-# Run-1: FREEZE the backbone (HPG_FREEZE_BACKBONE=1) -> only retention_head.linear
-# trains; KL-to-SFT-head is EXACT; protects the video features that make ckpt-150
-# beat the length baseline. Unfreeze in a later run.
+# Option B = full fine-tune (train LLM+head; freeze vit/aligner, like the SFT) + deepspeed zero3
+# (the PROVEN SFT backend). Verified on 2 cards: self-check Δ=0, clean run, eval-loadable ckpt.
 #
-# ** per_device_train_batch_size MUST be 1 ** (head reads the LITERAL last token;
-# bs>1 right-pads and L-1 becomes a PAD hidden -> mismatches eval). Scale via
-# gradient_accumulation_steps and more GPUs, not batch size.
-#
-# NOTE: no `loss_type` — HeadPGTrainer.compute_loss fully overrides the loss
-# (the swift-injected compute_loss_func is popped, never used).
+# ** per_device_train_batch_size MUST be 1 ** (head reads the LITERAL last token; bs>1 right-pads
+# -> L-1 becomes a PAD hidden -> mismatches eval). Scale via grad-accum + more GPUs, not bs.
+# attn_impl pinned to flash_attn; eval must use the SAME kernel (re-baseline ckpt-150 SRCC under it).
 
-model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-150  # SFT ckpt-150 on the 2x8 cluster (us-east-2)
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-150  # SFT ckpt-150 (us-east-2)
 torch_dtype: bfloat16
-attn_impl: flash_attn
+attn_impl: flash_attn               # PINNED; eval baseline must match this kernel
 
 external_plugins:
   - examples/custom/qwen2_5_omni_retention/register.py
@@ -32,16 +26,16 @@ model_type: qwen2_5_omni_retention
 
 ENV:
   RETENTION_HEAD_TYPE: hazard
-  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # built on cluster (build_cdf, val-disjoint verified)
+  HPG_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # train-only, val-disjoint
   HPG_G: '16'
   HPG_SIGMA: '0.2'
-  HPG_KL: '0.04'
+  HPG_KL: '0.1'                     # stronger (full-FT can drift); verified KL~0.07 at this setting
   HPG_CLIP: '1.0'
   HPG_TLO: '1'
   HPG_THI: '30'
-  HPG_FREEZE_BACKBONE: '1'
+  HPG_FREEZE_BACKBONE: '0'          # B: train LLM+head (vit/aligner frozen below) -> zero3 partitions cleanly
 
-dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl   # assistant=<cot></cot>, video+R (built on cluster)
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl   # assistant=<cot></cot>, video+R
 max_length: 32768
 truncation_strategy: delete
 lazy_tokenize: true
@@ -50,24 +44,24 @@ dataset_num_proc: 1
 group_by_length: false
 remove_unused_columns: false
 
-tuner_type: full                    # backbone frozen at runtime by HPG_FREEZE_BACKBONE
-freeze_vit: true
+tuner_type: full
+freeze_vit: true                    # mirror SFT
 freeze_aligner: true
 
-gradient_checkpointing: false       # backbone frozen -> no backbone backward, no ckpt needed
-vit_gradient_checkpointing: false
+gradient_checkpointing: true        # full-FT 3B+Adam needs it for activations (SFT uses it too)
+vit_gradient_checkpointing: true
 torch_compile: false
-# deepspeed omitted: run-1 freezes the backbone -> plain DDP (3B fits one H100)
+deepspeed: zero3                    # PROVEN SFT backend; works via mu_z-from-output derivation
 
-num_train_epochs: 1
-learning_rate: 1.0e-4               # head lr (smoke best); backbone frozen
+num_train_epochs: 1                 # ~280 steps at effective batch 128 (low end of SRCC-movement window)
+learning_rate: 5.0e-6               # full-FT rate (like SFT), NOT the head-only 1e-4
 warmup_ratio: 0.03
 max_grad_norm: 1.0                  # == HPG_CLIP
 per_device_train_batch_size: 1      # REQUIRED (see header)
-gradient_accumulation_steps: 8      # effective ads/step = 1 * 8 * world_size
+gradient_accumulation_steps: 8      # effective ads/step = 1 * 8 * world_size (=128 on 2x8)
 
 logging_steps: 1
-eval_strategy: 'no'                 # held-out cross-ad SRCC evaluated separately (eval_ibs bypass)
+eval_strategy: 'no'                 # held-out cross-ad SRCC tracked separately per-checkpoint (eval box)
 save_steps: 25
 save_total_limit: 20
 report_to: [tensorboard, wandb]
