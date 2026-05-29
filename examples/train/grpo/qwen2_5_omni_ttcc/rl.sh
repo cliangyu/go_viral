@@ -52,7 +52,9 @@ cd "${REPO_ROOT}"
 if [[ "${NNODES}" -eq 1 && "${NPROC_PER_NODE}" -eq 1 ]]; then
     exec "${VENV}/bin/python" "${ENTRY}" "${CONFIG_ABS}" "$@"
 else
-    exec "${VENV}/bin/torchrun" \
+    # use `python -m torch.distributed.run` (the form swift's own CLI uses); the
+    # `torchrun` console-script may be absent even when torch is installed.
+    exec "${VENV}/bin/python" -m torch.distributed.run \
         --nnodes "${NNODES}" --node_rank "${NODE_RANK}" \
         --nproc_per_node "${NPROC_PER_NODE}" \
         --master_addr "${MASTER_ADDR}" --master_port "${MASTER_PORT}" \
