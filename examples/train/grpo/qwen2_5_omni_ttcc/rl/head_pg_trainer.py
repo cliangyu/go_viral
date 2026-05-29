@@ -53,15 +53,8 @@ from swift.utils import get_logger
 
 logger = get_logger()
 
-# --- 1. CONFIGURATIONS (env) ---
-G = int(os.environ.get('HPG_G', '16'))
-SIGMA = float(os.environ.get('HPG_SIGMA', '0.2'))
-KL_COEF = float(os.environ.get('HPG_KL', '0.04'))
-CLIP = float(os.environ.get('HPG_CLIP', '1.0'))
-T_LO = int(os.environ.get('HPG_TLO', '1'))
-T_HI = int(os.environ.get('HPG_THI', '30'))
-CDF_PATH = os.environ.get('HPG_CDF', '')
-FREEZE_BACKBONE = os.environ.get('HPG_FREEZE_BACKBONE', '1') == '1'
+# --- 1. CONFIGURATIONS --- read in __init__ (AFTER the entry's parse_yaml_args
+# has exported the yaml ENV: block), NOT at import time.
 
 
 def load_cdf(path):
@@ -81,15 +74,24 @@ class HeadPGTrainer(Seq2SeqTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert CDF_PATH and os.path.exists(CDF_PATH), f'HPG_CDF missing/not found: {CDF_PATH!r}'
+        # config (read now: the entry's parse_yaml_args already exported the ENV block)
+        self.G = int(os.environ.get('HPG_G', '16'))
+        self.sigma = float(os.environ.get('HPG_SIGMA', '0.2'))
+        self.kl_coef = float(os.environ.get('HPG_KL', '0.04'))
+        self.clip = float(os.environ.get('HPG_CLIP', '1.0'))
+        self.t_lo = int(os.environ.get('HPG_TLO', '1'))
+        self.t_hi = int(os.environ.get('HPG_THI', '30'))
+        self.freeze_backbone = os.environ.get('HPG_FREEZE_BACKBONE', '1') == '1'
+        cdf_path = os.environ.get('HPG_CDF', '')
+        assert cdf_path and os.path.exists(cdf_path), f'HPG_CDF missing/not found: {cdf_path!r}'
         # A2: bs MUST be 1 so the last column is the real last token (== eval).
         bs = getattr(self.args, 'per_device_train_batch_size', 1)
         assert bs == 1, (f'HeadPGTrainer requires per_device_train_batch_size=1 '
                          f'(got {bs}); bs>1 right-pads -> h_anchor at L-1 becomes a PAD '
                          f'hidden and mismatches eval. Use grad_accum / more GPUs to scale.')
-        self._cdf = load_cdf(CDF_PATH)
+        self._cdf = load_cdf(cdf_path)
         base = self._base()
-        if FREEZE_BACKBONE:
+        if self.freeze_backbone:
             n_train = 0
             for p in self.model.parameters():
                 p.requires_grad_(False)
@@ -100,8 +102,8 @@ class HeadPGTrainer(Seq2SeqTrainer):
         self._ref_W = base.retention_head.linear.weight.detach().clone()
         self._ref_b = base.retention_head.linear.bias.detach().clone()
         self._selfcheck_done = False
-        logger.info(f'[head-pg] G={G} sigma={SIGMA} kl={KL_COEF} clip={CLIP} '
-                    f't=[{T_LO},{T_HI}] freeze_backbone={FREEZE_BACKBONE}')
+        logger.info(f'[head-pg] G={self.G} sigma={self.sigma} kl={self.kl_coef} clip={self.clip} '
+                    f't=[{self.t_lo},{self.t_hi}] freeze_backbone={self.freeze_backbone}')
 
     def _base(self):
         m = self.accelerator.unwrap_model(self.model)
@@ -153,23 +155,24 @@ class HeadPGTrainer(Seq2SeqTrainer):
             self._selfcheck_done = True
 
         # --- 4. MATH: head-PG REINFORCE (all reward/adv/action detached) ---
+        G, sigma = self.G, self.sigma
         mu_rep = mu_z.unsqueeze(1).expand(B, G, Tmax)                 # shares the ONE forward graph
         eps = torch.randn(B, G, Tmax, device=mu_z.device)
-        z = (mu_rep + SIGMA * eps).detach()                          # action, detached
+        z = (mu_rep + sigma * eps).detach()                          # action, detached
         curves = RC.curve_from_hazards(z.view(B * G, Tmax))          # (B*G, Tmax+1)
         Rh = [curves[i].tolist() for i in range(B * G)]
         Rt = [R_true_list[b] for b in range(B) for _ in range(G)]
-        rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, T_LO, T_HI),
+        rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, self.t_lo, self.t_hi),
                               dtype=torch.float32, device=mu_z.device).view(B, G)
         adv = (rew - rew.mean(dim=1, keepdim=True)) / (rew.std(dim=1, keepdim=True) + 1e-6)
         adv = adv.view(-1).detach()
-        logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), SIGMA)
+        logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), sigma)
         pg = -(logp * adv).mean()
         # KL to frozen SFT head (computed on the CURRENT h_anchor)
         mu_ref = (h_anchor.to(w_dtype) @ self._ref_W.t().to(w_dtype)
                   + self._ref_b.to(w_dtype)).float().detach()
-        kl = (((mu_z - mu_ref) ** 2) / (2 * SIGMA ** 2)).sum(dim=-1).mean()
-        loss = pg + KL_COEF * kl
+        kl = (((mu_z - mu_ref) ** 2) / (2 * sigma ** 2)).sum(dim=-1).mean()
+        loss = pg + self.kl_coef * kl
 
         # log (best-effort, swift custom_metrics + holder fallback)
         self._log(reward=float(rew.mean()), within_grp_std=float(rew.std(dim=1).mean()),
@@ -185,7 +188,7 @@ class HeadPGTrainer(Seq2SeqTrainer):
             pass
 
     def create_optimizer(self):
-        # grad-clip is applied by HF Trainer via max_grad_norm; set it from CLIP.
-        if getattr(self.args, 'max_grad_norm', None) in (None, 0) or self.args.max_grad_norm != CLIP:
-            self.args.max_grad_norm = CLIP
+        # grad-clip is applied by HF Trainer via max_grad_norm; set it from self.clip.
+        if getattr(self.args, 'max_grad_norm', None) != self.clip:
+            self.args.max_grad_norm = self.clip
         return super().create_optimizer()

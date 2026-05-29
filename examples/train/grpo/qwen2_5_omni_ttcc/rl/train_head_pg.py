@@ -59,8 +59,14 @@ class HeadPGSft(SwiftSft):
 
 
 def main():
-    # Pass argv explicitly (sft_main's documented List[str] path): [<config.yaml>, --override ...]
-    return HeadPGSft(sys.argv[1:]).main()
+    # Reuse swift's own yaml loader (the `swift sft` CLI path): it reads <config.yaml>,
+    # exports the ENV: block (RETENTION_HEAD_TYPE, HPG_*), and expands the rest into
+    # --key value argv IN PLACE. This is why HeadPGTrainer reads HPG_* in __init__, not
+    # at import: ENV is exported here, at runtime.
+    from swift.cli.main import parse_yaml_args
+    argv = sys.argv[1:]                     # [<config.yaml>, --override ...]
+    parse_yaml_args(argv)                   # mutates argv: yaml -> --args; os.environ <- ENV
+    return HeadPGSft(argv).main()
 
 
 if __name__ == '__main__':
