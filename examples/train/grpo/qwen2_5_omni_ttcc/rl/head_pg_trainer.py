@@ -226,6 +226,11 @@ class HeadPGTrainer(Seq2SeqTrainer):
                                   dtype=torch.float32, device=mu_z.device).view(B, G)
         adv = (rew - rew.mean(dim=1, keepdim=True)) / (rew.std(dim=1, keepdim=True) + 1e-6)
         adv = adv.view(-1).detach()
+        # WARMUP SKIP (crossad): until the cross-ad buffer is warm, concordance is computed against
+        # too few ads -> noisy advantage that drifts the head off the SFT init (the run-2 ckpt-25
+        # dip). Zero the advantage (pg=0; KL still anchors) until len(buffer) >= buf_min.
+        if self.reward_mode == 'crossad' and len(self._buffer) < self.buf_min:
+            adv = torch.zeros_like(adv)
         logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), sigma)
         pg = -(logp * adv).mean()
         # KL to frozen SFT head on the CURRENT features. Detach h_anchor so the KL ref is a
