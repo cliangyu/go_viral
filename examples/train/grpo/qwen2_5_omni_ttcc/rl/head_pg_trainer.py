@@ -126,6 +126,20 @@ class HeadPGTrainer(Seq2SeqTrainer):
         return m
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Enable DDP static_graph on the first step (before the first forward/backward).
+        # Needed because head.linear is reached by two forward-time autograd branches (our
+        # captured z + the patched forward's r_pred); without static_graph the DDP Reducer
+        # raises "mark a variable ready only once". static_graph counts grad-hook fires
+        # instead of asserting once. swift doesn't expose --ddp_static_graph, so set it here
+        # on the DDP-wrapped `model` (== self.model_wrapped during training).
+        if not getattr(self, '_static_graph_set', False):
+            self._static_graph_set = True
+            if hasattr(model, '_set_static_graph'):
+                try:
+                    model._set_static_graph()
+                    logger.info('[head-pg] DDP static_graph ENABLED')
+                except Exception as e:
+                    logger.warning(f'[head-pg] _set_static_graph failed: {e}')
         # swift's base compute_loss pops these non-model keys before model(**inputs);
         # we override compute_loss so we must pop them too (else the Qwen forward sees
         # unexpected kwargs). We use no LM labels in RL (reward is the only objective).
