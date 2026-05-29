@@ -25,6 +25,20 @@ if command -v yq >/dev/null 2>&1 && yq e '.ENV // {} | keys' "${CONFIG_ABS}" >/d
     done < <(yq e '.ENV // {} | to_entries | .[] | .key + "=" + (.value | tostring)' "${CONFIG_ABS}")
 fi
 
+# CUDA_HOME: transformers Trainer.__init__ imports deepspeed (via accelerate's
+# unwrap_model) even when we don't use ZeRO; deepspeed's import-time op probe RAISES
+# if CUDA_HOME is unset/invalid. The DLAMI eval box has /usr/local/cuda; the H100
+# cluster host does NOT, so fall back to the torch-bundled cu1x toolkit (matches
+# torch's CUDA version). This is the env the SFT launch path implicitly relied on.
+if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME:-/none}/bin/nvcc" ]]; then
+    if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+        export CUDA_HOME=/usr/local/cuda
+    else
+        _NVCC="$(find /opt /usr/local "${VENV%/*}" -maxdepth 7 -path '*nvidia/cu1*/bin/nvcc' 2>/dev/null | head -1)"
+        [[ -n "${_NVCC}" ]] && export CUDA_HOME="$(dirname "$(dirname "${_NVCC}")")"
+    fi
+fi
+
 : "${NNODES:=1}"; : "${NODE_RANK:=0}"; : "${MASTER_ADDR:=localhost}"; : "${MASTER_PORT:=29500}"
 if [[ -z "${NPROC_PER_NODE:-}" ]]; then
     if command -v nvidia-smi >/dev/null 2>&1; then NPROC_PER_NODE="$(nvidia-smi -L | wc -l)"; else NPROC_PER_NODE=1; fi
@@ -32,6 +46,7 @@ fi
 
 echo "[$(date '+%F %T')] rl.sh launching ${CONFIG_ABS}"
 echo "  NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} NPROC_PER_NODE=${NPROC_PER_NODE}"
+echo "  CUDA_HOME=${CUDA_HOME:-(unset)}  VENV=${VENV}"
 cd "${REPO_ROOT}"
 
 if [[ "${NNODES}" -eq 1 && "${NPROC_PER_NODE}" -eq 1 ]]; then
