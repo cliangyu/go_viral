@@ -28,6 +28,15 @@ CONFIG_ABS="$(cd "$(dirname "${CONFIG}")" && pwd)/$(basename "${CONFIG}")"
 #     _common.sh uses ':=' so our topology vars above are NOT clobbered. ---
 source "${HERE}/_common.sh"
 
+# --- SFT-launcher overrides NOT in _common.sh (mirror launch_training_2node.sh EXACTLY, the
+#     ground-truth env ckpt-225 was trained under). _common.sh's USE_AUDIO_IN_VIDEO default is
+#     a STALE 'true'; the SFT overrode it to false in the launcher (drop-audio fix for AUDIO_OOB).
+#     The RL MUST match (audio off) to be consistent with ckpt-225 AND to avoid re-triggering OOB. ---
+export USE_AUDIO_IN_VIDEO=false     # ckpt-225 trained WITHOUT audio (launch_training_2node.sh:51)
+export DS_BUILD_OPS=0               # don't JIT-build deepspeed CUDA ops (the SFT's approach; avoids nvcc dep)
+export AWS_DEFAULT_REGION=us-east-2
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 # --- paths / venv (override per box; _common.sh already set these via ':=') ---
 : "${VENV:=/opt/dlami/nvme/work/swift_venv}"
 : "${TTCC_REPO:=${REPO_ROOT}}"
