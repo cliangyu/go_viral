@@ -101,6 +101,13 @@ class HeadPGTrainer(Seq2SeqTrainer):
         # KL reference = frozen SFT head (exact when backbone frozen; approx otherwise)
         self._ref_W = base.retention_head.linear.weight.detach().clone()
         self._ref_b = base.retention_head.linear.bias.detach().clone()
+        # Capture the head's pre-activation z from the forward's SINGLE head.linear call.
+        # Recomputing mu_z = head.linear(h_anchor) in compute_loss would be a SECOND use of
+        # head.linear in the same step -> under DDP the reducer raises "Expected to mark a
+        # variable ready only once". The hook lets us reuse the forward's z (one use).
+        self._z_cap = {}
+        base.retention_head.linear.register_forward_hook(
+            lambda _m, _inp, out: self._z_cap.__setitem__('z', out))
         self._selfcheck_done = False
         logger.info(f'[head-pg] G={self.G} sigma={self.sigma} kl={self.kl_coef} clip={self.clip} '
                     f't=[{self.t_lo},{self.t_hi}] freeze_backbone={self.freeze_backbone}')
@@ -121,12 +128,18 @@ class HeadPGTrainer(Seq2SeqTrainer):
         base = self._base()
         holder = base._retention_h_holder
         head = base.retention_head
-        h_last = holder.last                           # (B, L, d); requires grad iff backbone trainable
+        h_last = holder.last                           # (B, L, d)
         B = h_last.size(0)
         # A1: literal last token (matches register's dead-anchor fallback L-1).
-        h_anchor = h_last[:, -1, :]                    # (B, d)
+        h_anchor = h_last[:, -1, :]                    # (B, d) — used for the KL ref only (no head.linear call)
         w_dtype = head.linear.weight.dtype
-        mu_z = head.linear(h_anchor.to(w_dtype)).float()   # (B, Tmax)  == the forward's head input
+        # mu_z = the head's pre-activation z captured from the forward's SINGLE head.linear
+        # call (see __init__ hook). Reusing it (not recomputing) keeps head.linear used once
+        # per step -> DDP marks it ready exactly once.
+        z_cap = self._z_cap.get('z')
+        if z_cap is None:
+            raise RuntimeError('head.linear forward-hook did not fire; cannot obtain mu_z')
+        mu_z = z_cap.float()                           # (B, Tmax)
         Tmax = mu_z.size(1)
 
         # A3: reconstruct true curves R(0..T) from holder
