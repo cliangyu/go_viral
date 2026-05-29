@@ -1,4 +1,4 @@
-# 2-GPU DDP + FULL-FT test (option B via DDP, eval box us-east-1) — verifies the PROVEN SFT
+# 2-GPU ZeRO-3 + FULL-FT test (option B, eval box us-east-1) — verifies the PROVEN SFT
 # substrate (deepspeed zero3 + freeze vit/aligner + train LLM+head) runs our head-PG
 # compute_loss and saves an eval-loadable checkpoint. Mirrors the SFT config; only the loss
 # differs. Run: NPROC_PER_NODE=2 bash rl.sh <this> --max_steps 4
@@ -19,7 +19,7 @@ ENV:
   HPG_CLIP: '1.0'
   HPG_TLO: '1'
   HPG_THI: '30'
-  HPG_FREEZE_BACKBONE: '0'          # B: train LLM+head (vit/aligner frozen below) -> zero3 partitions cleanly
+  HPG_FREEZE_BACKBONE: '0'          # B: train LLM+head; vit/aligner frozen below (matches SFT)
 
 dataset: /opt/dlami/nvme/v8_eval/data/ttcc_train_bypass.jsonl
 max_length: 32768
@@ -35,7 +35,7 @@ freeze_aligner: true
 gradient_checkpointing: true        # full-FT 3B+Adam needs it for activations (SFT uses it too)
 vit_gradient_checkpointing: true
 torch_compile: false
-# deepspeed: (none) -> plain DDP; 3B full-FT fits one 80GB GPU, no sharding needed
+deepspeed: zero3                    # PROVEN SFT backend; works now that mu_z is derived from the model output
 
 num_train_epochs: 1
 learning_rate: 5.0e-6               # full-FT rate (like SFT), not the head-only 1e-4
@@ -49,7 +49,7 @@ eval_strategy: 'no'
 save_steps: 3
 save_total_limit: 2
 report_to: [tensorboard]
-output_dir: /opt/dlami/nvme/v8_eval/rl_ddp_full_test
+output_dir: /opt/dlami/nvme/v8_eval/rl_zero3_rpred_test
 
 dataloader_num_workers: 2
 dataloader_persistent_workers: true

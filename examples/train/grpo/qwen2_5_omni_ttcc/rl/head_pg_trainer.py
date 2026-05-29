@@ -118,20 +118,12 @@ class HeadPGTrainer(Seq2SeqTrainer):
             self._ref_W = _lin.weight.detach().float().clone()
             self._ref_b = _lin.bias.detach().float().clone()
         logger.info(f'[head-pg] KL ref captured: W{tuple(self._ref_W.shape)} b{tuple(self._ref_b.shape)}')
-        # Capture the head's pre-activation z from the forward's SINGLE head.linear call.
-        # Recomputing mu_z = head.linear(h_anchor) in compute_loss would be a SECOND use of
-        # head.linear in the same step -> under DDP the reducer raises "Expected to mark a
-        # variable ready only once". The hook lets us reuse the forward's z (one use).
-        self._z_cap = {}
-        base.retention_head.linear.register_forward_hook(
-            lambda _m, _inp, out: self._z_cap.__setitem__('z', out))
-        # NOTE on DDP: head.linear's output z feeds TWO forward-time autograd consumers — the
-        # patched model.forward's r_pred branch (softplus->cumsum->exp) and our mu_z. DDP's
-        # Reducer counts FORWARD-TIME uses (not backward grad-flow), so it double-marks and
-        # raises "mark a variable ready only once". Detaching the curve OUTPUT does NOT help
-        # (the softplus ops are already built on grad-z). The fix is DDP static_graph=True
-        # (--ddp_static_graph) which counts hook fires instead of asserting once. Verified by
-        # research + empirical (find_unused / output-detach / zero3 all fail).
+        # mu_z (the head's hazards) is DERIVED from the model's OUTPUT curve r_pred inside
+        # compute_loss — NOT captured from an intermediate. This routes the backward through
+        # the STANDARD model.forward -> output -> loss path that DDP and ZeRO-3 both instrument
+        # (exactly like GRPO derives its loss from the model's logits), so ZeRO-3/FSDP/DDP all
+        # work with NO hooks and NO static_graph. mu_z = softplus^{-1}(-Δlog r_pred), the exact
+        # inverse of the head's R = exp(-cumsum(softplus(z))).
         self._selfcheck_done = False
         logger.info(f'[head-pg] G={self.G} sigma={self.sigma} kl={self.kl_coef} clip={self.clip} '
                     f't=[{self.t_lo},{self.t_hi}] freeze_backbone={self.freeze_backbone}')
@@ -143,20 +135,6 @@ class HeadPGTrainer(Seq2SeqTrainer):
         return m
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Enable DDP static_graph on the first step (before the first forward/backward).
-        # Needed because head.linear is reached by two forward-time autograd branches (our
-        # captured z + the patched forward's r_pred); without static_graph the DDP Reducer
-        # raises "mark a variable ready only once". static_graph counts grad-hook fires
-        # instead of asserting once. swift doesn't expose --ddp_static_graph, so set it here
-        # on the DDP-wrapped `model` (== self.model_wrapped during training).
-        if not getattr(self, '_static_graph_set', False):
-            self._static_graph_set = True
-            if hasattr(model, '_set_static_graph'):
-                try:
-                    model._set_static_graph()
-                    logger.info('[head-pg] DDP static_graph ENABLED')
-                except Exception as e:
-                    logger.warning(f'[head-pg] _set_static_graph failed: {e}')
         # swift's base compute_loss pops these non-model keys before model(**inputs);
         # we override compute_loss so we must pop them too (else the Qwen forward sees
         # unexpected kwargs). We use no LM labels in RL (reward is the only objective).
@@ -169,16 +147,18 @@ class HeadPGTrainer(Seq2SeqTrainer):
         h_last = holder.last                           # (B, L, d)
         B = h_last.size(0)
         # A1: literal last token (matches register's dead-anchor fallback L-1).
-        h_anchor = h_last[:, -1, :]                    # (B, d) — used for the KL ref only (no head.linear call)
+        h_anchor = h_last[:, -1, :]                    # (B, d) — for the KL ref only (detached below)
         w_dtype = head.linear.weight.dtype
-        # mu_z = the head's pre-activation z captured from the forward's SINGLE head.linear
-        # call (see __init__ hook). Reusing it (not recomputing) keeps head.linear used once
-        # per step -> DDP marks it ready exactly once.
-        z_cap = self._z_cap.get('z')
-        if z_cap is None:
-            raise RuntimeError('head.linear forward-hook did not fire; cannot obtain mu_z')
-        mu_z = z_cap.float()                           # (B, Tmax)
-        Tmax = mu_z.size(1)
+        # mu_z (hazards) DERIVED from the model's OUTPUT curve r_pred — the standard, backend-
+        # instrumented path (DDP/ZeRO-3 backward hooks fire normally; like GRPO from logits).
+        # r_pred is grad-connected to head.linear + backbone. lambda(t)=log R(t-1)-log R(t)=
+        # softplus(z); mu_z=softplus^{-1}(lambda), the exact inverse of the head.
+        r_pred = holder.r_pred.float()                 # (B, Tmax) = R(1..Tmax), grad-connected
+        Tmax = r_pred.size(1)
+        R_prev = torch.cat([torch.ones(B, 1, device=r_pred.device, dtype=r_pred.dtype),
+                            r_pred[:, :-1]], dim=1)     # R(0..Tmax-1)
+        lam = (R_prev.clamp_min(1e-8).log() - r_pred.clamp_min(1e-8).log()).clamp_min(1e-7)  # =softplus(z)>0
+        mu_z = torch.log(torch.expm1(lam))             # softplus^{-1} -> z  (B, Tmax), grad flows via r_pred
 
         # A3: reconstruct true curves R(0..T) from holder
         r_true = holder.r_true.float()
@@ -219,9 +199,11 @@ class HeadPGTrainer(Seq2SeqTrainer):
         adv = adv.view(-1).detach()
         logp = RC.gaussian_logp(z.view(B * G, Tmax), mu_rep.reshape(B * G, Tmax), sigma)
         pg = -(logp * adv).mean()
-        # KL to frozen SFT head (computed on the CURRENT h_anchor)
-        mu_ref = (h_anchor.to(w_dtype) @ self._ref_W.t().to(w_dtype)
-                  + self._ref_b.to(w_dtype)).float().detach()
+        # KL to frozen SFT head on the CURRENT features. Detach h_anchor so the KL ref is a
+        # fixed target (no grad to the backbone via this term) -> the ONLY grad path to
+        # head.linear+backbone is via mu_z (r_pred), keeping it a single standard path.
+        mu_ref = (h_anchor.detach().to(w_dtype) @ self._ref_W.t().to(w_dtype)
+                  + self._ref_b.to(w_dtype)).float()
         kl = (((mu_z - mu_ref) ** 2) / (2 * sigma ** 2)).sum(dim=-1).mean()
         loss = pg + self.kl_coef * kl
 
