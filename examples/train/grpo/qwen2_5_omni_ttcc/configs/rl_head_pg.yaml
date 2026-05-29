@@ -4,8 +4,12 @@
 # action z'=z+sigma*eps; curve=exp(-cumsum(softplus(z'))); reward = cross-ad
 # percentile-rank vs the train-only CDF; advantage = within-ad group-relative;
 # loss = -(logpi*A) + KL to the frozen SFT head. Implemented in
-# rl/head_pg_trainer.py (Seq2SeqTrainer.compute_loss override), wired via
-# rl/rl_register.py (TrainerFactory causal_lm -> HeadPGTrainer). See NORTH_STAR §10.
+# rl/head_pg_trainer.py (Seq2SeqTrainer.compute_loss override).
+#
+# ** LAUNCH WITH rl/train_head_pg.py — NOT `swift sft`. ** This is RL; the entry
+# subclasses SwiftSft for its mechanics (one forward + custom loss) and swaps in
+# HeadPGTrainer. See NORTH_STAR §10. external_plugins loads only register.py
+# (model_type/template/forward); the trainer is selected by the entry, not the factory.
 #
 # Run-1: FREEZE the backbone (HPG_FREEZE_BACKBONE=1) -> only retention_head.linear
 # trains; KL-to-SFT-head is EXACT; protects the video features that make ckpt-150
@@ -24,7 +28,6 @@ attn_impl: flash_attn
 
 external_plugins:
   - examples/custom/qwen2_5_omni_retention/register.py
-  - examples/train/grpo/qwen2_5_omni_ttcc/rl/rl_register.py
 model_type: qwen2_5_omni_retention
 
 ENV:
