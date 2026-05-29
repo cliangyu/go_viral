@@ -96,6 +96,7 @@ class HeadPGTrainer(Seq2SeqTrainer):
         #     per-ad percentile-match calibration reward (cosine 0.0 -> dead; kept for A/B). ---
         self.reward_mode = os.environ.get('HPG_REWARD', 'crossad').lower()
         self.beta = float(os.environ.get('HPG_BETA', '10.0'))         # concordance sigmoid sharpness
+        self.margin = float(os.environ.get('HPG_MARGIN', '0.0'))      # run-4: drop pairs with |true gap|<margin (large-margin -> generalizes)
         self.buf_cap = int(os.environ.get('HPG_BUF', '256'))          # per-GPU FIFO of recent ads
         self.buf_min = int(os.environ.get('HPG_BUF_MIN', '8'))        # warmup: below this, low signal
         self._buffer = deque(maxlen=self.buf_cap)                     # [(pred_mean_curve, true_curve)]
@@ -216,7 +217,7 @@ class HeadPGTrainer(Seq2SeqTrainer):
                 rollouts_b = [curves[b * G + g].tolist() for g in range(G)]
                 rew_rows.append(CARR.crossad_rank_reward(
                     rollouts_b, R_true_list[b], buf_pred, buf_true,
-                    t_lo=self.t_lo, t_hi=self.t_hi, beta=self.beta))
+                    t_lo=self.t_lo, t_hi=self.t_hi, beta=self.beta, margin=self.margin))
                 self._buffer.append((mean_curves[b].tolist(), R_true_list[b]))  # add AFTER scoring
             rew = torch.as_tensor(np.stack(rew_rows), dtype=torch.float32, device=mu_z.device).view(B, G)
         else:  # 'rrank' — run-1 per-ad percentile-match calibration reward (A/B / fallback)

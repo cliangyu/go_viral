@@ -31,7 +31,7 @@ def _sigmoid(x):
 
 
 def crossad_rank_reward(R_hat_rollouts, R_true_self, buf_pred, buf_true,
-                        t_lo=1, t_hi=30, beta=10.0):
+                        t_lo=1, t_hi=30, beta=10.0, margin=0.0):
     """Rewards (G,) for one ad's G rollout curves vs a reference buffer of other ads.
 
     R_hat_rollouts : list[G] of curves (each list/array, R(0..T_A))  -- this ad's rollouts
@@ -57,9 +57,14 @@ def crossad_rank_reward(R_hat_rollouts, R_true_self, buf_pred, buf_true,
         T_B = len(B_true) - 1
         hiB = min(hi, T_B, len(B_pred) - 1)
         for t in range(t_lo, hiB + 1):
-            s = np.sign(self_true[t] - B_true[t])
+            gap = self_true[t] - B_true[t]
+            if abs(gap) < margin:
+                continue                       # near-tie (|gap|<margin): noisy order -> drop.
+                                               # margin=0 keeps all (run-2/3); margin>0 = large-margin
+                                               # LtR -> generalizes (Lan et al. 2009), fixes over-opt.
+            s = np.sign(gap)
             if s == 0.0:
-                continue                       # tie in the truth -> undefined order, drop
+                continue                       # exact tie -> undefined order, drop
             cols.append((t, B_pred[t], s))
     if not cols:
         return np.full(G, 0.5, dtype=np.float64)
