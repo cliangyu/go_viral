@@ -57,6 +57,8 @@ def main():
     ap.add_argument('--t-lo', type=int, default=1)
     ap.add_argument('--t-hi', type=int, default=30)
     ap.add_argument('--output', default=None)
+    ap.add_argument('--dump-npz', default=None,
+                    help='dump per-ad ad_ids/preds/trues/Ts for paired-bootstrap CI (paired_bootstrap.py)')
     args = ap.parse_args()
 
     os.environ['RETENTION_HEAD_TYPE'] = args.head_type
@@ -92,7 +94,7 @@ def main():
                 break
 
     # per-ad predicted + true curves
-    preds, trues, Ts, skipped = [], [], [], 0
+    preds, trues, Ts, ids, skipped = [], [], [], [], 0
     for i, r in enumerate(rows):
         R_true = np.array(r.get('R') or r.get('R_true'), dtype=np.float64)
         T = len(R_true) - 1
@@ -112,7 +114,7 @@ def main():
             R_pred = np.concatenate([[1.0], rp[0].float().cpu().numpy()])   # R(0..Tmax)
         except (MaxLengthError, Exception) as e:                            # noqa
             skipped += 1; continue
-        preds.append(R_pred); trues.append(R_true); Ts.append(T)
+        preds.append(R_pred); trues.append(R_true); Ts.append(T); ids.append(str(r.get('ad_id', '')))
         if (i + 1) % 25 == 0:
             print(f'[srcc] {len(preds)} evaluated, {skipped} skipped')
 
@@ -138,6 +140,10 @@ def main():
                    'per_t': {str(t): {'rho': v[0], 'n': v[1]} for t, v in per_t.items()}},
                   open(args.output, 'w'), indent=2)
         print(f'[srcc] wrote {args.output}')
+    if args.dump_npz:
+        np.savez(args.dump_npz, ad_ids=np.array(ids), Ts=np.array(Ts),
+                 preds=np.array(preds, dtype=object), trues=np.array(trues, dtype=object))
+        print(f'[srcc] dumped {len(ids)} per-ad curves -> {args.dump_npz}')
 
 
 if __name__ == '__main__':
