@@ -16,7 +16,7 @@
 # -> L-1 becomes a PAD hidden -> mismatches eval). Scale via grad-accum + more GPUs, not bs.
 # attn_impl pinned to flash_attn; eval must use the SAME kernel (re-baseline ckpt-150 SRCC under it).
 
-model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-150  # SFT ckpt-150 (us-east-2)
+model: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_with_cot/v19-20260528-180726/checkpoint-225  # SFT ckpt-225 = latest/best (us-east-2); init RL from here
 torch_dtype: bfloat16
 attn_impl: flash_attn               # PINNED; eval baseline must match this kernel
 
