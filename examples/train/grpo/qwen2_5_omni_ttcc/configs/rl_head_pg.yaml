@@ -54,7 +54,7 @@ torch_compile: false
 deepspeed: zero3                    # PROVEN SFT backend; works via mu_z-from-output derivation
 
 num_train_epochs: 1                 # ~280 steps at effective batch 128 (low end of SRCC-movement window)
-learning_rate: 5.0e-6               # full-FT rate (like SFT), NOT the head-only 1e-4
+learning_rate: 1.0e-6               # decision-A: every full-FT GRPO (DeepSeekMath/DAPO/TRL/verl/ms-swift) uses 1e-6; protects baseline
 warmup_ratio: 0.03
 max_grad_norm: 1.0                  # == HPG_CLIP
 per_device_train_batch_size: 1      # REQUIRED (see header)

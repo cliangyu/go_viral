@@ -15,13 +15,20 @@ ENTRY="${HERE}/rl/train_head_pg.py"
 CONFIG="${1:?path to configs/<variant>.yaml required}"; shift || true
 CONFIG_ABS="$(cd "$(dirname "${CONFIG}")" && pwd)/$(basename "${CONFIG}")"
 
-# --- topology ---
+# --- topology (set BEFORE sourcing _common.sh so our values win its ':=' defaults) ---
 : "${NNODES:=2}"; : "${NODE_RANK:?set NODE_RANK (0 or 1)}"
 : "${MASTER_ADDR:?set MASTER_ADDR = node-0 private IP}"
 : "${MASTER_PORT:=29501}"          # NOT 29500 (the SFT torchrun holds 29500)
 : "${NPROC_PER_NODE:=8}"
 
-# --- paths / venv (override per box) ---
+# --- INHERIT THE SFT'S PROVEN ENV (the env ckpt-225 was trained under; the RL MUST match it,
+#     else it processes video differently -> inconsistent with ckpt-225 + the SRCC baseline).
+#     Gives: FPS=1.0, VIDEO_MAX_TOKEN_NUM=8192, USE_AUDIO_IN_VIDEO=true, ENABLE_AUDIO_OUTPUT=False,
+#     MAX_PIXELS/VIDEO_MAX_PIXELS=49152, WANDB_ENTITY=liangyuch, WANDB_PROJECT=ttcc, VENV, PYTHONPATH.
+#     _common.sh uses ':=' so our topology vars above are NOT clobbered. ---
+source "${HERE}/_common.sh"
+
+# --- paths / venv (override per box; _common.sh already set these via ':=') ---
 : "${VENV:=/opt/dlami/nvme/work/swift_venv}"
 : "${TTCC_REPO:=${REPO_ROOT}}"
 export PYTHONPATH="${TTCC_REPO}:${PYTHONPATH:-}"
