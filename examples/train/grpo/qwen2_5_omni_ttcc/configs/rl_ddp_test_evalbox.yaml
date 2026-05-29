@@ -1,8 +1,7 @@
-# THROWAWAY 2-GPU DDP test (eval box us-east-1) — empirically verifies:
-#   (a) DDP with a FROZEN backbone runs (find_unused_parameters?),
-#   (b) 2-rank rendezvous + our compute_loss under DDP,
-#   (c) a checkpoint is SAVED and is eval-loadable.
-# Not for production; eval-box paths. Run: NPROC_PER_NODE=2 bash rl.sh <this> --max_steps 4
+# 2-GPU ZeRO-3 + FULL-FT test (option B, eval box us-east-1) — verifies the PROVEN SFT
+# substrate (deepspeed zero3 + freeze vit/aligner + train LLM+head) runs our head-PG
+# compute_loss and saves an eval-loadable checkpoint. Mirrors the SFT config; only the loss
+# differs. Run: NPROC_PER_NODE=2 bash rl.sh <this> --max_steps 4
 model: /opt/dlami/nvme/v8_eval/ckpt-150
 torch_dtype: bfloat16
 attn_impl: flash_attn
@@ -16,11 +15,11 @@ ENV:
   HPG_CDF: /opt/dlami/nvme/v8_eval/rl/train_cdf.npz
   HPG_G: '16'
   HPG_SIGMA: '0.2'
-  HPG_KL: '0.04'
+  HPG_KL: '0.1'
   HPG_CLIP: '1.0'
   HPG_TLO: '1'
   HPG_THI: '30'
-  HPG_FREEZE_BACKBONE: '1'
+  HPG_FREEZE_BACKBONE: '0'          # B: train LLM+head (vit/aligner frozen below) -> zero3 partitions cleanly
 
 dataset: /opt/dlami/nvme/v8_eval/data/ttcc_train_bypass.jsonl
 max_length: 32768
@@ -33,11 +32,13 @@ remove_unused_columns: false
 tuner_type: full
 freeze_vit: true
 freeze_aligner: true
-gradient_checkpointing: false
+gradient_checkpointing: true        # full-FT needs it for activations (like SFT)
+vit_gradient_checkpointing: true
 torch_compile: false
+deepspeed: zero3                    # the PROVEN SFT backend
 
 num_train_epochs: 1
-learning_rate: 1.0e-4
+learning_rate: 5.0e-6               # full-FT rate (like SFT), not the head-only 1e-4
 warmup_ratio: 0.03
 max_grad_norm: 1.0
 per_device_train_batch_size: 1
@@ -48,7 +49,7 @@ eval_strategy: 'no'
 save_steps: 3
 save_total_limit: 2
 report_to: [tensorboard]
-output_dir: /opt/dlami/nvme/v8_eval/rl_ddp_test
+output_dir: /opt/dlami/nvme/v8_eval/rl_zero3_full_test
 
 dataloader_num_workers: 2
 dataloader_persistent_workers: true

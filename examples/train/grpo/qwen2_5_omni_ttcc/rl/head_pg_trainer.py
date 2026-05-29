@@ -74,6 +74,12 @@ class HeadPGTrainer(Seq2SeqTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Make HF normalize the loss by gradient_accumulation_steps. Our compute_loss returns
+        # a per-step MEAN REINFORCE loss and ignores num_items_in_batch; with the default
+        # model_accepts_loss_kwargs=True + 'labels' present, HF SKIPS the /grad_accum divide
+        # (transformers training_step guard) -> 8 micro-backwards sum un-normalized = 8x
+        # effective LR. Setting False makes HF divide correctly so effective LR == configured.
+        self.model_accepts_loss_kwargs = False
         # config (read now: the entry's parse_yaml_args already exported the ENV block)
         self.G = int(os.environ.get('HPG_G', '16'))
         self.sigma = float(os.environ.get('HPG_SIGMA', '0.2'))
