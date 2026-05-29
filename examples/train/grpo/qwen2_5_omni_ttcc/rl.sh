@@ -31,12 +31,12 @@ fi
 # cluster host does NOT, so fall back to the torch-bundled cu1x toolkit (matches
 # torch's CUDA version). This is the env the SFT launch path implicitly relied on.
 if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME:-/none}/bin/nvcc" ]]; then
-    if [[ -x /usr/local/cuda/bin/nvcc ]]; then
-        export CUDA_HOME=/usr/local/cuda
-    else
-        _NVCC="$(find /opt /usr/local "${VENV%/*}" -maxdepth 7 -path '*nvidia/cu1*/bin/nvcc' 2>/dev/null | head -1)"
-        [[ -n "${_NVCC}" ]] && export CUDA_HOME="$(dirname "$(dirname "${_NVCC}")")"
-    fi
+    for _cand in /usr/local/cuda \
+                 /opt/pytorch/lib/python*/site-packages/nvidia/cu* \
+                 "${VENV%/*}"/lib/python*/site-packages/nvidia/cu* \
+                 /opt/*/lib/python*/site-packages/nvidia/cu*; do
+        if [[ -x "${_cand}/bin/nvcc" ]]; then export CUDA_HOME="${_cand}"; break; fi
+    done
 fi
 
 : "${NNODES:=1}"; : "${NODE_RANK:=0}"; : "${MASTER_ADDR:=localhost}"; : "${MASTER_PORT:=29500}"
