@@ -59,9 +59,32 @@ def main():
     ap.add_argument('--output', default=None)
     ap.add_argument('--dump-npz', default=None,
                     help='dump per-ad ad_ids/preds/trues/Ts for paired-bootstrap CI (paired_bootstrap.py)')
+    ap.add_argument('--video-max-tokens', type=int, default=16384,
+                    help='MATCH SFT: the V8 SFT trained with VIDEO_MAX_TOKEN_NUM=16384 + VIDEO_MAX_PIXELS=200704 '
+                         '+ FPS_MAX_FRAMES=60. Verified via grid_thw: native frames = 92x52 grid (~937k px, BELOW '
+                         'the 200704 nominal cap so NOT downsized) -> 1196 tok/frame. VMT=256 forces 42x24 (4.7x '
+                         'lower res) = OUT-OF-DISTRIBUTION. Long videos hit 35,880 vid tokens and drop at max_length '
+                         '(the SFT dropped them too at its 24576 cap) -> a frozen, in-distribution ad-set.')
+    ap.add_argument('--per-ad-timeout', type=int, default=180,
+                    help='per-ad SIGALRM timeout (s). A pathological/corrupt video is skipped+logged instead '
+                         'of hanging the whole eval (incident guard for the 0-ads-in-30min stall).')
     args = ap.parse_args()
 
     os.environ['RETENTION_HEAD_TYPE'] = args.head_type
+    # CANONICAL video budget. The 0.5142 baseline (and every recorded _v8192 ckpt) was measured at
+    # video 8192 with the SFT caps MAX_PIXELS=200704 VIDEO_MAX_PIXELS=200704 FPS_MAX_FRAMES=60.
+    # swift's defaults (video 768, no pixel cap, fps_max 768) give a DIFFERENT feature -> 0.5005 not
+    # 0.5142, non-comparable. setdefault() so an explicit env still wins; print so the log is auditable.
+    os.environ.setdefault('MAX_PIXELS', '200704')
+    os.environ.setdefault('VIDEO_MAX_PIXELS', '200704')
+    os.environ.setdefault('FPS_MAX_FRAMES', '60')
+    os.environ.setdefault('FPS', '1.0')                # V8 trained at FPS=1.0 (_common.sh ${FPS:=1.0});
+                                                       # swift default is 2.0 -> 2x frames -> 2x tokens ->
+                                                       # inflates the drop rate (31% vs the documented ~18%).
+    os.environ.setdefault('VIDEO_MAX_TOKEN_NUM', str(args.video_max_tokens))
+    print(f'[srcc] CANONICAL video env: VIDEO_MAX_TOKEN_NUM={os.environ["VIDEO_MAX_TOKEN_NUM"]} '
+          f'MAX_PIXELS={os.environ["MAX_PIXELS"]} VIDEO_MAX_PIXELS={os.environ["VIDEO_MAX_PIXELS"]} '
+          f'FPS={os.environ["FPS"]} FPS_MAX_FRAMES={os.environ["FPS_MAX_FRAMES"]}', flush=True)
     import_plugin(args.plugin)
     from swift.model import get_model_processor
     from swift.template import get_template
@@ -94,14 +117,27 @@ def main():
                 break
 
     # per-ad predicted + true curves
-    preds, trues, Ts, ids, skipped = [], [], [], [], 0
+    import signal, time
+    class _AdTimeout(Exception):
+        pass
+    def _alarm(signum, frame):
+        raise _AdTimeout()
+    signal.signal(signal.SIGALRM, _alarm)
+
+    from collections import Counter
+    preds, trues, Ts, ids, skipped, timed_out = [], [], [], [], 0, []
+    skip_reasons, skip_msgs = Counter(), []
+    t_start = time.time()
     for i, r in enumerate(rows):
         R_true = np.array(r.get('R') or r.get('R_true'), dtype=np.float64)
         T = len(R_true) - 1
         if T < 5:
-            skipped += 1; continue
+            skipped += 1; skip_reasons['T<5'] += 1; continue
         row = dict(r); row['messages'] = list(r['messages'])
         row['messages'][-1] = {'role': 'assistant', 'content': '<cot></cot>'}   # bypass
+        adid = str(r.get('ad_id', ''))
+        t0 = time.time()
+        signal.alarm(max(1, args.per_ad_timeout))    # INCIDENT GUARD: skip a hung/pathological video
         try:
             enc = template.encode(TemplateInputs.from_dict(row))
             batch = template.data_collator([enc])
@@ -112,11 +148,25 @@ def main():
             if rp is None:
                 rp = model._retention_h_holder.r_pred
             R_pred = np.concatenate([[1.0], rp[0].float().cpu().numpy()])   # R(0..Tmax)
-        except (MaxLengthError, Exception) as e:                            # noqa
+        except _AdTimeout:
+            signal.alarm(0)
+            timed_out.append(adid)
+            print(f'[srcc] TIMEOUT ad={adid} (> {args.per_ad_timeout}s) -> skipped [INCIDENT-GUARD]', flush=True)
             skipped += 1; continue
-        preds.append(R_pred); trues.append(R_true); Ts.append(T); ids.append(str(r.get('ad_id', '')))
-        if (i + 1) % 25 == 0:
-            print(f'[srcc] {len(preds)} evaluated, {skipped} skipped')
+        except (MaxLengthError, Exception) as e:                            # noqa
+            signal.alarm(0)
+            skipped += 1; skip_reasons[type(e).__name__] += 1
+            print(f'[srcc] SKIP ad={adid}: {type(e).__name__}: {str(e)[:180]}', flush=True)
+            continue
+        finally:
+            signal.alarm(0)
+        preds.append(R_pred); trues.append(R_true); Ts.append(T); ids.append(adid)
+        if len(preds) % 25 == 0:
+            dt = time.time() - t_start
+            print(f'[srcc] {len(preds)} evaluated, {skipped} skipped, '
+                  f'{dt/max(1,len(preds)):.1f}s/ad avg, last={time.time()-t0:.1f}s', flush=True)
+    if timed_out:
+        print(f'[srcc] {len(timed_out)} ads TIMED OUT (pathological videos): {timed_out[:20]}', flush=True)
 
     n = len(preds)
     # cross-ad SRCC: at each second t, Spearman across ads with T>=t
