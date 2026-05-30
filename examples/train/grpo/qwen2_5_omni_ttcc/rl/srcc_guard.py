@@ -12,8 +12,10 @@ WHAT IT DOES (every `guard_steps`, during training)
      of truth for the metric).
   2. Logs the FULL metric set to wandb (cross-ad SRCC + auc + per-t + saturation/drift
      detectors) so you SEE train-reward-up / val-SRCC-down in one view.
-  3. Tracks the running best -> best-ckpt selection; early-stops after `patience`
-     consecutive guard evals below best-margin (rollback signal).
+  3. Tracks the running best -> best-ckpt selection. OBSERVE-ONLY: it does NOT
+     auto-stop training (project rule: all experiments end MANUALLY). It only
+     LOGS a rollback-candidate warning when held-out SRCC has been below best for
+     `patience` consecutive guard evals; the human decides when to stop.
 
 DESIGN NOTES
   - Reuses the existing observability pipeline by logging via `wandb.log` (rank-0 only),
@@ -191,10 +193,8 @@ class HeldoutSRCCGuard(TrainerCallback):
             print(f'[guard] step={step} cross_ad_srcc={srcc:.4f} auc={metrics.get("eval_auc_spearman", float("nan")):.4f} '
                   f'best={self.best:.4f}@{self.best_step} since_best={metrics["eval_steps_since_best"]} '
                   f'n={metrics["eval_n_ads"]} tail={metrics.get("eval_curve_tail", float("nan")):.3f}', flush=True)
-        # rollback signal: stop after `patience` consecutive evals below best
-        if self.bad >= self.patience:
-            if args.local_rank in (-1, 0):
-                print(f'[guard] EARLY STOP: {self.bad} guard-evals below best {self.best:.4f}@{self.best_step}; '
-                      f'rollback to checkpoint-{self.best_step}', flush=True)
-            control.should_training_stop = True
+        # OBSERVE-ONLY rollback CANDIDATE warning (we never auto-stop; experiments end manually).
+        if self.bad >= self.patience and args.local_rank in (-1, 0):
+            print(f'[guard] ROLLBACK CANDIDATE: held-out SRCC below best for {self.bad} guard-evals; '
+                  f'best={self.best:.4f}@checkpoint-{self.best_step}. (NOT stopping — manual decision.)', flush=True)
         return control

@@ -55,6 +55,20 @@ class HeadPGSft(SwiftSft):
             eval_dataset=val_dataset,
             **self._get_trainer_kwargs(),
         )
+        # In-loop held-out cross-ad SRCC guard: over-opt observability (train-reward-up /
+        # val-SRCC-down becomes visible live) + best-ckpt tracking. OBSERVE-ONLY (never
+        # auto-stops; experiments end manually). Opt-in via env so it's off by default:
+        #   HPG_GUARD_HOLDOUT=<disjoint holdout jsonl>  (HPG_GUARD_STEPS / HPG_GUARD_REF_MU optional)
+        guard_holdout = os.environ.get('HPG_GUARD_HOLDOUT')
+        if guard_holdout:
+            from srcc_guard import HeldoutSRCCGuard
+            trainer.add_callback(HeldoutSRCCGuard(
+                guard_holdout, self.template,
+                guard_steps=int(os.environ.get('HPG_GUARD_STEPS', '25')),
+                ref_mu_npz=os.environ.get('HPG_GUARD_REF_MU') or None,
+            ))
+            logger.info(f'[head-pg] held-out SRCC guard ON: holdout={guard_holdout} '
+                        f'every {os.environ.get("HPG_GUARD_STEPS", "25")} steps')
         return self.train(trainer)
 
 
