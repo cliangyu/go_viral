@@ -198,3 +198,50 @@ If a sweet spot exists, do exactly **one** more run with a **calibration-anchore
 composite reward + the guard on**. If not, **ship SFT and write the negative result** —
 it's rigorous and complete. Either way, **stop the idle box now and stop pouring GPU into
 the un-guarded reinforce run.**
+
+---
+
+## 9. ROOT CAUSE of the token_acc collapse (code-confirmed, 2026-05-30)
+
+**Leon's observation ("only the retention-head loss descends, the CoT loss doesn't") is literally correct.** Mechanism, from `register.py:724-738` + `configs/sft_retention_hazard_full_with_cot.yaml:53`:
+
+    L_total = loss_curve(MSE on R(t))  +  alpha * loss_cot(LM cross-entropy on assistant span)
+    alpha = RETENTION_COT_ALPHA = 1e-3     # config-set; code default is 0.0
+
+- `loss_curve` runs ~29 (init) → ~0.1 (end). `alpha*loss_cot` ≈ 1e-3 * ~3 ≈ **3e-3** throughout.
+- So the CoT term is **<1% early (≈0.01%) and ~3% late** of the total loss/gradient. Under
+  **full fine-tuning**, the dominant curve-MSE gradient reshapes the *shared backbone* purely for
+  curve prediction; the ~1%-weighted CoT-CE cannot keep the LM head intact ⇒ CoT generation
+  **collapses (token_acc 0.557 → 0.004)**. `loss_cot` doesn't descend — it *rises* (CE up as acc
+  falls) — but its gradient is swamped, so it never steers.
+- **Why a fixed scalar alpha was structurally doomed:** `loss_curve` drifts ~40–290× over training
+  while alpha is constant. The LM is *least* protected exactly when the backbone is reshaping most
+  violently (early). A hand-tuned fixed weight cannot balance two losses with different scales and
+  dynamics. → need **gradient-balanced multi-task weighting** (GradNorm / Kendall uncertainty /
+  PCGrad), or normalize `loss_curve`, or a phased schedule — not a bigger scalar alone.
+- **Secondary co-factors to check:** full-FT LR too high for LM preservation; no KL-to-base-LM
+  regularizer; curve-MSE scale. (alpha imbalance is the dominant, code-confirmed cause.)
+
+**Separate issue — data quality (Leon):** the CoT targets are Gemini-generated and may not match the
+video. This is NOT what collapses token_acc (a bad-target run would *plateau* acc at a moderate
+level, not destroy it to 0.4%). But it sets (a) the *achievable* token_acc ceiling and (b) whether a
+*coherent* CoT is *causally useful* for retention. Audit a sample for video-consistency. For an
+RL-on-CoT path, imperfect Gemini CoT is an acceptable bootstrap (RL corrects it); for pure-SFT-CoT it
+is a hard ceiling (you cannot SFT past wrong targets).
+
+**Does RL need token_acc maintained? Depends on the RL:**
+- *Head-RL* (on h_anchor, what we ran): does NOT need token_acc — but it saturates at 0.44. Dead end
+  for leveraging reasoning.
+- *Reasoning-RL* (RL on the CoT generation, retention reward): token_acc maintained is a **hard
+  prerequisite** — RL refines an existing capability; it cannot bootstrap coherent generation from a
+  destroyed LM (token_acc 0.004 = degenerate action space). You need preserved generation so RL has a
+  real action space to sculpt toward retention-predictive reasoning.
+
+**The target (what "where should we get to" means):**
+1. SFT goal: a checkpoint where **BOTH** losses descend — head predicts the curve well (IBS ≤ current,
+   SRCC ≥ 0.44) **AND** token_acc maintained (≈ base 0.5+, "维持住"). Fix the multi-task balance.
+2. Diagnostic gate: with a coherent CoT, run `--generate-cot` vs `--cot-bypass` ΔIBS. If generating
+   the CoT now *helps* (ΔIBS>0), the reasoning thesis is finally alive → reasoning-RL has headroom.
+3. RL goal: optimize the CoT generation so the produced reasoning maximizes held-out prediction —
+   beating the SFT-bypass 0.44 by making h_anchor conditioned on RL-sculpted reasoning that extracts
+   more from the video than the raw representation.
