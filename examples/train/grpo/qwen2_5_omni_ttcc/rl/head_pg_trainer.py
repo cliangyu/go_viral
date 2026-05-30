@@ -173,10 +173,14 @@ class HeadPGTrainer(Seq2SeqTrainer):
         # softplus(z); mu_z=softplus^{-1}(lambda), the exact inverse of the head.
         r_pred = holder.r_pred.float()                 # (B, Tmax) = R(1..Tmax), grad-connected
         Tmax = r_pred.size(1)
-        R_prev = torch.cat([torch.ones(B, 1, device=r_pred.device, dtype=r_pred.dtype),
-                            r_pred[:, :-1]], dim=1)     # R(0..Tmax-1)
-        lam = (R_prev.clamp_min(1e-8).log() - r_pred.clamp_min(1e-8).log()).clamp_min(1e-7)  # =softplus(z)>0
-        mu_z = torch.log(torch.expm1(lam))             # softplus^{-1} -> z  (B, Tmax), grad flows via r_pred
+        # BUG A FIX: read the head's ACTUAL pre-softplus hazard logits (= mu_z) directly from the
+        # holder, instead of reconstructing them via softplus^{-1}(R). The old inversion
+        # `lam=(logR_prev-logR_pred).clamp_min(1e-7); mu_z=log(expm1(lam))` (a) ZEROED the gradient at
+        # flat seconds (clamp_min passes 0 grad below the floor) and (b) had a 1/lam Jacobian that
+        # blew up as R(t)->R(t-1). z is exact, grad-connected (z=head.linear(h_anchor)), and the
+        # head produced r_pred FROM this exact z, so the self-check curve_from_hazards(mu_z)==r_pred
+        # holds exactly.
+        mu_z = holder.z.float()                        # (B, Tmax), grad flows via head.linear + backbone
 
         # A3: reconstruct true curves R(0..T) from holder
         r_true = holder.r_true.float()
@@ -236,8 +240,10 @@ class HeadPGTrainer(Seq2SeqTrainer):
             Rt = [R_true_list[b] for b in range(B) for _ in range(G)]
             rew = torch.as_tensor(reward_fn(Rh, Rt, self._cdf, self.t_lo, self.t_hi),
                                   dtype=torch.float32, device=mu_z.device).view(B, G)
-        adv = (rew - rew.mean(dim=1, keepdim=True)) / (rew.std(dim=1, keepdim=True) + 1e-6)
-        adv = adv.view(-1).detach()
+        # BUG B FIX: use the unit-tested reinforce_core.group_advantage (the single source of truth)
+        # instead of an inlined copy that had drifted to eps=1e-6 (the tested path uses 1e-8). Now the
+        # executed advantage == the verified one; group_advantage views rew as (-1, G) and returns (B*G,).
+        adv = RC.group_advantage(rew.reshape(-1), G).detach()
         # WARMUP SKIP (crossad): until the cross-ad buffer is warm, concordance is computed against
         # too few ads -> noisy advantage that drifts the head off the SFT init (the run-2 ckpt-25
         # dip). Zero the advantage (pg=0; KL still anchors) until len(buffer) >= buf_min.

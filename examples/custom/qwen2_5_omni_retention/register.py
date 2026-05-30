@@ -213,6 +213,11 @@ class RetentionHead(nn.Module):
         # so the downstream cumsum + exp stays numerically stable.
         w_dtype = self.linear.weight.dtype
         z = self.linear(h.to(w_dtype)).float()
+        # Expose the pre-activation logits z (= the policy mean mu_z for the hazard head) so the
+        # RL trainer can read mu_z DIRECTLY rather than reconstructing it via the ill-conditioned
+        # softplus^{-1}(R) inversion (head_pg_trainer Bug A: the old inversion zeroed the gradient
+        # at flat seconds via clamp_min and its 1/lam Jacobian blew up as R(t)->R(t-1)).
+        self._last_z = z
         if self.head_type == 'hazard':
             lam = F.softplus(z)                                       # (B, T) >= 0
             return torch.exp(-torch.cumsum(lam, dim=-1))              # (B, T) in (0, 1]
@@ -244,7 +249,7 @@ class _HiddenStateHolder:
       Our pre_hook is registered at model-load time (before swift's),
       so PyTorch fires it first and we get the pre-conversion value.
     """
-    __slots__ = ('last', 'input_ids', 'r_true', 'r_mask', 'r_pred',
+    __slots__ = ('last', 'input_ids', 'r_true', 'r_mask', 'r_pred', 'z',
                  'loss_curve', 'loss_cot', 'cot_alpha')
 
     def __init__(self):
@@ -253,6 +258,7 @@ class _HiddenStateHolder:
         self.r_true = None
         self.r_mask = None
         self.r_pred = None
+        self.z = None
         self.loss_curve = None
         self.loss_cot = None
         self.cot_alpha = None
@@ -298,9 +304,11 @@ def _make_retention_forward(original_forward, head: RetentionHead,
         # on the holder as a fallback. RetentionLoss reads via getattr first
         # and falls back to holder.r_pred if missing.
         out.r_pred = r_pred
+        out.mu_z = getattr(head, '_last_z', None)                     # pre-softplus z = mu_z (Bug A: read directly, no inversion)
         out.r_true = r_true
         out.r_mask = r_mask
         holder.r_pred = r_pred
+        holder.z = getattr(head, '_last_z', None)
         # r_true / r_mask are already in holder from _post_encode; refresh
         # only if the caller passed explicit overrides.
         if r_true is not None:
