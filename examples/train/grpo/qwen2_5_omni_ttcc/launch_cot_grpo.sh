@@ -38,6 +38,8 @@ echo "[cot-grpo] node ${NODE_RANK}/${NNODES} GPUS=${GPUS} nproc=${NPROC} ga=${GA
 
 EXTRA=()
 [[ -n "${ADAPTERS:-}" ]] && EXTRA+=(--adapters "${ADAPTERS}")
+[[ -n "${TEMP:-}" ]] && EXTRA+=(--temperature "${TEMP}")            # diversity lever (default 0.4 from config)
+[[ -n "${BETA:-}" ]] && EXTRA+=(--beta "${BETA}")                   # KL coef (default 0.001 from config)
 
 RL_ENTRY=rl/train_cot_grpo.py \
 NPROC_PER_NODE="${NPROC}" CUDA_VISIBLE_DEVICES="${GPUS}" \
