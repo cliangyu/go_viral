@@ -35,18 +35,41 @@ def head_curve(model, template, TI, row, assistant):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--checkpoint',required=True); ap.add_argument('--val-jsonl',required=True); ap.add_argument('--plugin',required=True)
+    ap.add_argument('--base',default=None,
+                    help='original base model (processor + weights source). REQUIRED for chained RL adapters: '
+                         'their adapter_config base points at the warm-start adapter dir, which has no processor. '
+                         'For SFT adapters it is optional (their adapter_config base is already the original model).')
     ap.add_argument('--attn-impl',default='flash_attn'); ap.add_argument('--head-type',default='hazard')
     ap.add_argument('--max-length',type=int,default=32768); ap.add_argument('--max-new',type=int,default=600)
+    ap.add_argument('--video-max-tokens',type=int,default=16384,
+                    help='MATCH SFT (VIDEO_MAX_TOKEN_NUM). Must equal srcc_eval to keep bypass vs reasoned comparable.')
     ap.add_argument('--limit',type=int,default=None); ap.add_argument('--t-lo',type=int,default=1); ap.add_argument('--t-hi',type=int,default=30)
     ap.add_argument('--output',default=None)
     args=ap.parse_args()
-    os.environ['RETENTION_HEAD_TYPE']=args.head_type; import_plugin(args.plugin)
+    os.environ['RETENTION_HEAD_TYPE']=args.head_type
+    # CANONICAL video env -- MUST match srcc_eval.py exactly, else bypass(srcc_eval) vs reasoned(this) and the
+    # SFT/RL comparison are measured under DIFFERENT video features (swift defaults: video 768, fps 2.0) -> non-comparable.
+    # The SFT trained at MAX_PIXELS=200704 VIDEO_MAX_PIXELS=200704 FPS=1.0 FPS_MAX_FRAMES=60 VIDEO_MAX_TOKEN_NUM=16384.
+    os.environ.setdefault('MAX_PIXELS','200704'); os.environ.setdefault('VIDEO_MAX_PIXELS','200704')
+    os.environ.setdefault('FPS_MAX_FRAMES','60'); os.environ.setdefault('FPS','1.0')
+    os.environ.setdefault('VIDEO_MAX_TOKEN_NUM',str(args.video_max_tokens))
+    print(f'[gen] CANONICAL video env: VIDEO_MAX_TOKEN_NUM={os.environ["VIDEO_MAX_TOKEN_NUM"]} '
+          f'MAX_PIXELS={os.environ["MAX_PIXELS"]} FPS={os.environ["FPS"]} FPS_MAX_FRAMES={os.environ["FPS_MAX_FRAMES"]}',flush=True)
+    import_plugin(args.plugin)
     from swift.model import get_model_processor
     from swift.template import get_template
     from swift.template.template_inputs import TemplateInputs
     from swift.template.base import MaxLengthError
-    model,proc=get_model_processor(args.checkpoint,torch_dtype=torch.bfloat16,attn_impl=args.attn_impl,
-                                   model_kwargs={'device_map':'cuda'},model_type='qwen2_5_omni_retention')
+    adapter_cfg=os.path.join(args.checkpoint,'adapter_config.json')
+    if os.path.exists(adapter_cfg):
+        base=args.base or json.load(open(adapter_cfg))['base_model_name_or_path']
+        model,proc=get_model_processor(base,torch_dtype=torch.bfloat16,attn_impl=args.attn_impl,
+                                       model_kwargs={'device_map':'cuda'},model_type='qwen2_5_omni_retention')
+        from peft import PeftModel
+        model=PeftModel.from_pretrained(model,args.checkpoint,is_trainable=False)
+    else:
+        model,proc=get_model_processor(args.checkpoint,torch_dtype=torch.bfloat16,attn_impl=args.attn_impl,
+                                       model_kwargs={'device_map':'cuda'},model_type='qwen2_5_omni_retention')
     model.eval()
     tmpl_train=get_template(proc,max_length=args.max_length,template_type='qwen2_5_omni_retention',remove_unused_columns=False)
     tmpl_train.set_mode('train')
