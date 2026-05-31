@@ -112,40 +112,97 @@ def gen_cot_single(model, tmpl_gen, TI, proc, row, max_new):
 
 
 # ---- batched generation (the speedup) ---------------------------------------
-def gen_cot_batched(model, tmpl_gen, TI, proc, rows, max_new):
-    """Collate K rows into ONE generate() call. Returns list[str] of CoTs aligned
-    to `rows`. The collator LEFT-pads in transformers mode (base.py:1817) and
-    omits position_ids (qwen.py:933) so the model computes mrope itself with the
-    left-pad delta0 correction. We slice each row's NEW tokens off the right end
-    (generation is appended after the left-padded prompt block of width L).
+#
+# ROOT CAUSE OF THE EQUIVALENCE-SMOKE FAILURE (see research/BATCHED_EVAL_DEBUG.md)
+# --------------------------------------------------------------------------------
+# The plan blamed left-pad mrope position_ids. That hypothesis was FALSIFIED: a
+# CPU probe of the real transformers get_rope_index + the thinker.forward
+# `rope_deltas - delta0` correction proves the real-token mrope coordinates AND
+# the per-row decode-step absolute positions are BIT-IDENTICAL between a
+# left-padded batch row and the same row at batch=1 (ragged K=2 case included).
+# transformers 4.57.6 has this correction (verified against the v4.57 source).
+#
+# The actual divergence is NUMERICAL: with PADDING present, the attention softmax
+# + matmul over the (masked but still materialized) padded columns changes the
+# bf16 reduction order versus the unpadded batch=1 forward. Greedy argmax is a
+# hard max; whenever the top-2 logits are within bf16 rounding (~1e-2 on a 3B
+# model), the padded-batch argmax can flip, and from that token the sequences
+# diverge. r_pred then differs by ~9e-3 because it reads a DIFFERENT CoT — the
+# head readout itself is per-ad and bit-identical. No position_ids fix can remove
+# this; it is intrinsic to padded batched decode on GPU.
+#
+# THE FIX (deterministic by construction): LENGTH-BUCKETED, ZERO-PADDING batching.
+# Group rows by EXACT collated prompt length and only co-generate equal-length
+# rows. Equal length => the collator left-pads by ZERO => every row's attention
+# math is identical to its standalone batch=1 forward => CoTs are bit-identical to
+# batch=1, AND the decode loop is still amortized across the (common) clusters of
+# equal-length ads. Singleton lengths fall back to a 1-row generate (== batch=1).
+# This keeps the VRAM/throughput win on the equal-length majority while making the
+# n=4 smoke pass exactly. Set TTCC_BATCHED_ALLOW_PAD=1 to opt back into the old
+# pad-and-pray behaviour (faster, NOT bit-exact) once you accept the divergence.
 
-    Encoding is per-row (multimodal encode is inherently per-sample); only the
-    decode loop is amortized across the batch — that is where the 5-10x lives.
-    """
-    encs = []
-    for r in rows:
-        rg = dict(r); rg['messages'] = list(r['messages'])
-        rg['messages'][-1] = {'role': 'assistant', 'content': ''}
-        encs.append(tmpl_gen.encode(TI.from_dict(rg)))
-    batch = tmpl_gen.data_collator(encs)              # LEFT-pads input_ids/attn; stacks video tensors
+
+def _encode_row(tmpl_gen, TI, r):
+    rg = dict(r); rg['messages'] = list(r['messages'])
+    rg['messages'][-1] = {'role': 'assistant', 'content': ''}
+    return tmpl_gen.encode(TI.from_dict(rg))
+
+
+def _generate_bucket(model, tmpl_gen, proc, encs, max_new):
+    """Run ONE generate() over a list of encodings. Returns list[str] CoTs aligned
+    to `encs`. Caller guarantees determinism by only grouping equal-length encs
+    (zero padding) unless TTCC_BATCHED_ALLOW_PAD=1."""
+    batch = tmpl_gen.data_collator(encs)              # left-pads (zero pad if equal-len); stacks video tensors
     batch = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     for _k in _HEAD_TARGET_KWARGS:
         batch.pop(_k, None)
-    # SANITY: do NOT pass position_ids (must be absent so the model computes the
-    # left-pad-corrected mrope itself). If the collator ever emits one in
-    # inference mode, drop it — passing a pre-pad-shaped one would be wrong.
+    # do NOT pass position_ids — the model computes the left-pad-corrected mrope itself.
     batch.pop('position_ids', None)
-    L = batch['input_ids'].shape[1]                  # padded prompt width (left-padded)
+    L = batch['input_ids'].shape[1]                  # left-padded prompt width
     with torch.no_grad():
         gen = model.generate(**batch, max_new_tokens=max_new, do_sample=False, num_beams=1)
-    # gen: (K, L + n_new). With LEFT padding every row's prompt ends at column L-1,
-    # so the generated tokens for EVERY row are exactly gen[i, L:]. (Right-pad would
-    # need per-row offsets; left-pad makes the slice uniform — the whole point.)
-    cots = []
-    for i in range(gen.shape[0]):
-        new = gen[i][L:]
-        cots.append(_clean_cot(proc.tokenizer.decode(new, skip_special_tokens=True)))
-    return cots
+    # LEFT padding => every row's prompt ends at column L-1 => new tokens are gen[i, L:].
+    return [_clean_cot(proc.tokenizer.decode(gen[i][L:], skip_special_tokens=True))
+            for i in range(gen.shape[0])]
+
+
+def gen_cot_batched(model, tmpl_gen, TI, proc, rows, max_new):
+    """Generate CoTs for `rows`, returned in the SAME order as `rows`.
+
+    Deterministic-equivalent to batch=1: rows are bucketed by EXACT collated
+    prompt length and only equal-length rows share a generate() call (=> zero
+    padding => bit-identical to batch=1). Set TTCC_BATCHED_ALLOW_PAD=1 to allow
+    cross-length padding (faster, NOT bit-exact — see header).
+
+    Encoding is per-row (multimodal encode is inherently per-sample); only the
+    decode loop is amortized across equal-length rows — that is where the win lives.
+    """
+    allow_pad = os.environ.get('TTCC_BATCHED_ALLOW_PAD', '0') == '1'
+    encs = [_encode_row(tmpl_gen, TI, r) for r in rows]
+    out: list = [None] * len(rows)
+
+    if allow_pad:
+        # Legacy: one padded generate() over the whole batch (NOT bit-exact).
+        for i, c in enumerate(_generate_bucket(model, tmpl_gen, proc, encs, max_new)):
+            out[i] = c
+        return out
+
+    # Deterministic path: bucket by exact input_ids length -> zero padding.
+    def _ids_len(e):
+        ids = e.get('input_ids')
+        if ids is None:
+            return -1
+        if isinstance(ids, torch.Tensor):
+            return int(ids.shape[-1])                  # tolerate (L,) or (1, L)
+        return len(ids)                                # pre-collation: a 1-D python list
+    buckets: dict = {}
+    for i, e in enumerate(encs):
+        buckets.setdefault(_ids_len(e), []).append(i)
+    for n, idxs in buckets.items():
+        cots = _generate_bucket(model, tmpl_gen, proc, [encs[i] for i in idxs], max_new)
+        for i, c in zip(idxs, cots):
+            out[i] = c
+    return out
 
 
 def main():
