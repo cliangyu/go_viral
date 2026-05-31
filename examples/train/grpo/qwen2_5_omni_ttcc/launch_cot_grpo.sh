@@ -29,7 +29,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NPROC="$(echo "${GPUS}" | tr ',' '\n' | grep -c .)"
 
 mkdir -p "${OUT}"
-echo "[cot-grpo] node ${NODE_RANK}/${NNODES} GPUS=${GPUS} nproc=${NPROC} ga=${GA} -> ${LOG}"
+# W&B (entity/project from _common.sh: liangyuch/ttcc). Only the main process logs; a per-run name.
+export WANDB_NAME="${WANDB_NAME:-$(basename "${OUT}")}"
+echo "[cot-grpo] node ${NODE_RANK}/${NNODES} GPUS=${GPUS} nproc=${NPROC} ga=${GA} wandb=${WANDB_NAME} -> ${LOG}"
 
 EXTRA=()
 [[ -n "${ADAPTERS:-}" ]] && EXTRA+=(--adapters "${ADAPTERS}")
@@ -40,7 +42,7 @@ NNODES="${NNODES}" NODE_RANK="${NODE_RANK}" MASTER_ADDR="${MASTER_ADDR}" MASTER_
   bash "${HERE}/rl.sh" "${HERE}/configs/rl_cot_grpo.yaml" \
     --gradient_accumulation_steps "${GA}" \
     --save_steps 25 --save_total_limit 40 --logging_steps 1 \
-    --report_to tensorboard \
+    --report_to tensorboard wandb \
     --output_dir "${OUT}" "${EXTRA[@]}" \
   > "${LOG}" 2>&1
 echo "[cot-grpo] exited -> ${LOG}"
