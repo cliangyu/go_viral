@@ -30,7 +30,10 @@ NPROC="$(echo "${GPUS}" | tr ',' '\n' | grep -c .)"
 
 mkdir -p "${OUT}"
 # W&B (entity/project from _common.sh: liangyuch/ttcc). Only the main process logs; a per-run name.
+# WANDB_DIR MUST be a writable path: wandb defaults to <cwd>/wandb (= the repo root, NOT writable
+# by ssm-user) and the run hard-crashes with PermissionError. Point it at the (writable) OUT dir.
 export WANDB_NAME="${WANDB_NAME:-$(basename "${OUT}")}"
+export WANDB_DIR="${WANDB_DIR:-${OUT}}"
 echo "[cot-grpo] node ${NODE_RANK}/${NNODES} GPUS=${GPUS} nproc=${NPROC} ga=${GA} wandb=${WANDB_NAME} -> ${LOG}"
 
 EXTRA=()
