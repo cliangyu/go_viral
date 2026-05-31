@@ -49,9 +49,11 @@ max_completion_length: 512            # measured CoT p99=430, max 527
 beta: 0.001                           # KL to SFT ref (grpo.sh: 0.04 was 16x too strong)
 reward_funcs: [ttcc_head, ttcc_cot_format]
 reward_weights: [1.0, 0.15]
-use_vllm: true
-vllm_mode: colocate
-vllm_gpu_memory_utilization: 0.35
+# HF generate (TransformersEngine), NOT vLLM. vLLM can't load our custom qwen2_5_omni_retention
+# head (no r_pred -> no reward) and its Qwen-Omni video+audio support is incomplete; our entire
+# pipeline (generate_eval, SFT eval) uses model.generate(). swift gates vllm behind is_vllm_available
+# so use_vllm=false needs no vllm installed. Slower rollouts, but correct + proven-compatible.
+use_vllm: false
 log_completions: true
 
 # --- tuner: LoRA on the text decoder (tonight's lower-risk choice) ---
