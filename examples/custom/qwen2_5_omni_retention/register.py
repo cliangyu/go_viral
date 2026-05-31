@@ -727,9 +727,22 @@ class RetentionLoss(BaseLoss):
         loss_cot = None
         if alpha > 0 and labels is not None and getattr(outputs, 'logits', None) is not None:
             logits = outputs.logits
+            # CRITICAL SHIFT (fix 2026-05-30): ms-swift hands the loss RAW (unshifted)
+            # labels. Every correct consumer shifts to the next-token target — the
+            # canonical per_token_loss_func uses torch.roll(labels,-1) (trainers/utils.py),
+            # channel-loss masks on roll(labels,-1) (seq2seq_trainer.py), and the
+            # label_smoother path passes shift_labels=True. The previous code compared
+            # logits[i] to labels[i] (NO shift): since SFT response tokens are BOTH input
+            # and label, h[i] already contains labels[i], so this is a trivial COPY task
+            # that drives loss_cot->~0 while DESTROYING genuine next-token prediction
+            # (root cause of the token_acc collapse 0.50->~0.005, full-FT AND LoRA, that
+            # alpha-tuning never fixed because the objective itself was malformed). roll
+            # wraps labels[0] (=-100, prompt/BOS) into the last position -> ignored,
+            # matching swift's own convention exactly.
+            shift_labels = torch.roll(labels, shifts=-1, dims=-1)
             loss_cot = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                shift_labels.view(-1),
                 ignore_index=-100,
             )
             total = loss_curve + alpha * loss_cot
@@ -757,6 +770,20 @@ class RetentionLoss(BaseLoss):
                 if loss_cot is not None:
                     holder.loss_cot = float(loss_cot.detach().item())
                     holder.cot_alpha = float(alpha)
+            # --- log component losses to swift's custom_metrics (same path swift uses for
+            # aux_loss / token_acc). Direct write from inside the loss, which already holds the
+            # live trainer -> fires from step 1, no monkeypatch, no callback. LOUD on failure
+            # (the 'stash without callback = silent gap' lesson: a logging failure must be visible).
+            try:
+                mode = 'train' if trainer.model.training else 'eval'
+                cm = trainer.custom_metrics[mode]
+                cm['loss_curve'].update(float(loss_curve.detach().item()))
+                if loss_cot is not None:
+                    cm['loss_cot'].update(float(loss_cot.detach().item()))
+                    cm['cot_alpha'].update(float(alpha))
+            except Exception as e:  # noqa: BLE001 -- observability must be loud, not swallowed
+                from swift.utils import get_logger
+                get_logger().warning_once(f'RetentionLoss: component-metric logging failed: {e!r}')
         return total
 
 
