@@ -24,7 +24,10 @@ export PYTHONPATH=$REPO
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONUNBUFFERED=1          # progress prints stream to the log (else block-buffered -> looks hung)
 MAXNEW="${MAXNEW:-384}"            # CoTs cap ~320 tok in training (completions/max_length 320); 384 is plenty + faster than 600
-PY=/opt/dlami/nvme/eval_venv/bin/python
+# PY + ATTN configurable: default = the (sdpa-only) eval_venv; for the TRAINING kernel use the team env
+#   PY=/home/ssm-user/work/venv/bin/python ATTN=flash_attention_2  (torch 2.8 + flash_attn 2.8.3, built for sm_120)
+PY="${PY:-/opt/dlami/nvme/eval_venv/bin/python}"
+ATTN="${ATTN:-sdpa}"
 echo "[$(date -u +%H:%M:%SZ) gpu$GPU] QUEUE START: $*"
 for entry in "$@"; do
   ch=$(echo "$entry" | cut -d: -f1)
@@ -36,10 +39,10 @@ for entry in "$@"; do
   echo "[$(date -u +%H:%M:%SZ) gpu$GPU] START $ch:$tag"
   if [ "$ch" = bypass ]; then
     "$PY" "$TT/rl/srcc_eval.py" --checkpoint "$CK/$nm" --base "$BASE" --val-jsonl "$VAL" \
-      --plugin "$REG" --attn-impl sdpa "${LIMARG[@]}" --output "$jout" > "$log" 2>&1 || echo "  (bypass $tag exited $?)"
+      --plugin "$REG" --attn-impl "$ATTN" "${LIMARG[@]}" --output "$jout" > "$log" 2>&1 || echo "  (bypass $tag exited $?)"
   else
     "$PY" "$TT/verification/generate_eval.py" --checkpoint "$CK/$nm" --base "$BASE" --val-jsonl "$VAL" \
-      --plugin "$REG" --attn-impl sdpa --max-new "$MAXNEW" "${LIMARG[@]}" --output "$jout" > "$log" 2>&1 || echo "  (reasoned $tag exited $?)"
+      --plugin "$REG" --attn-impl "$ATTN" --max-new "$MAXNEW" "${LIMARG[@]}" --output "$jout" > "$log" 2>&1 || echo "  (reasoned $tag exited $?)"
   fi
   echo "[$(date -u +%H:%M:%SZ) gpu$GPU] DONE  $ch:$tag -> $(grep -hoE 'SRCC \(.*|REASONED.*=.*|BYPASS.*=.*|delta.*' "$log" 2>/dev/null | tail -3 | tr '\n' ' | ')"
 done
