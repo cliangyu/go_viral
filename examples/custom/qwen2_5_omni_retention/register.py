@@ -135,6 +135,7 @@ logger = get_logger()
 
 T_MAX = 60
 CLOSE_COT = '</cot>'
+OPEN_COT = '<cot>'
 
 
 # ---- Helpers ------------------------------------------------------------
@@ -176,6 +177,56 @@ def _locate_anchor_positions(input_ids: torch.Tensor,
     positions = torch.where(positions >= 0, positions,
                             torch.full_like(positions, L - 1))
     return positions
+
+
+def _find_open_cot_token_ids(tokenizer) -> list[int]:
+    """Token id-sequence for the literal '<cot>' open marker (1+ ids; BPE)."""
+    ids = tokenizer.encode(OPEN_COT, add_special_tokens=False)
+    if not ids:
+        raise ValueError(f'tokenizer produced empty ids for {OPEN_COT!r}')
+    return ids
+
+
+def _locate_open_positions(input_ids, open_ids, close_first_idx):
+    """Per row, index of the LAST id of the last '<cot>' window whose end is
+    strictly before the matching '</cot>' first id. Returns -1 if none found."""
+    B, L = input_ids.shape
+    k = len(open_ids)
+    out = torch.full((B,), -1, device=input_ids.device, dtype=torch.long)
+    if L < k:
+        return out
+    open_t = torch.tensor(open_ids, device=input_ids.device, dtype=input_ids.dtype)
+    windows = input_ids.unfold(dimension=1, size=k, step=1)   # (B, L-k+1, k)
+    match = (windows == open_t).all(dim=-1)                    # (B, L-k+1)
+    for b in range(B):
+        idxs = match[b].nonzero(as_tuple=False).flatten()
+        if idxs.numel() == 0:
+            continue
+        end_idx = idxs + (k - 1)                               # last id of each open window
+        valid = end_idx[end_idx < int(close_first_idx[b].item())]
+        if valid.numel() > 0:
+            out[b] = valid[-1]
+    return out
+
+
+def _build_cot_span_mask(input_ids, open_ids, close_ids):
+    """Boolean mask (B, L), True ONLY on tokens strictly between the last
+    '<cot>' and the matching '</cot>' (the generated reasoning span). Excludes
+    prompt, video placeholders, the markers, padding, scaffolding.
+
+    Returns (mask, anchor_idx) where anchor_idx is the legacy last-token anchor
+    (last id of '</cot>', or L-1) for the empty-span fallback."""
+    B, L = input_ids.shape
+    anchor_idx = _locate_anchor_positions(input_ids, close_ids)            # (B,) last id of '</cot>' (or L-1)
+    kc = len(close_ids)
+    close_first = (anchor_idx - (kc - 1)).clamp(min=0)                     # first id of '</cot>'
+    open_last = _locate_open_positions(input_ids, open_ids, close_first)   # (B,) or -1
+    pos = torch.arange(L, device=input_ids.device).unsqueeze(0)           # (1, L)
+    have_span = open_last >= 0
+    lo = (open_last + 1).clamp(min=0).unsqueeze(1)                         # span start (inclusive)
+    hi = close_first.unsqueeze(1)                                          # span end (exclusive)
+    mask = (pos >= lo) & (pos < hi) & have_span.unsqueeze(1)               # (B, L) bool
+    return mask, anchor_idx
 
 
 # ---- Retention head -----------------------------------------------------
@@ -223,6 +274,32 @@ class RetentionHead(nn.Module):
             return torch.exp(-torch.cumsum(lam, dim=-1))              # (B, T) in (0, 1]
         # sigmoid
         return torch.sigmoid(z)
+
+
+# ---- Widened readout (V2): learned attention-pool over the CoT span ------
+
+class CoTAttnPool(nn.Module):
+    """k=1 learned cross-attention pool over the masked CoT span (NV-Embed
+    latent-attention / PMA k=1). One learnable seed query attends over the
+    CoT-span hidden states -> one pooled vector of size d. fp32 (feeds the
+    head's cumsum/exp chain), 8 heads, ~16.79M params at d=2048."""
+
+    def __init__(self, hidden_size: int, num_heads: int = 8):
+        super().__init__()
+        self.query = nn.Parameter(torch.empty(1, 1, hidden_size, dtype=torch.float32))
+        nn.init.normal_(self.query, std=0.02)
+        self.mha = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads,
+                                         batch_first=True, dtype=torch.float32)
+
+    def forward(self, h_last: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # h_last: (B, L, d); mask: (B, L) bool, True on CoT-span tokens.
+        w_dtype = self.mha.in_proj_weight.dtype
+        h = h_last.to(w_dtype)
+        q = self.query.to(w_dtype).expand(h.size(0), -1, -1)           # (B, 1, d)
+        key_padding_mask = ~mask                                       # True = IGNORE (non-CoT-span)
+        pooled, _ = self.mha(q, h, h, key_padding_mask=key_padding_mask,
+                             need_weights=False)                       # (B, 1, d)
+        return pooled[:, 0, :].float()                                 # (B, d)
 
 
 # ---- Model wrapper (subclass of the stock model) ------------------------
@@ -273,8 +350,12 @@ def _make_lm_head_capture_hook(holder: '_HiddenStateHolder'):
 
 
 def _make_retention_forward(original_forward, head: RetentionHead,
-                            anchor_ids: list[int], holder: '_HiddenStateHolder'):
-    """Patch the base model's forward so it also computes r_pred."""
+                            open_ids, anchor_ids, holder,
+                            readout='last_token', attn_pool=None):
+    """Patch the base model's forward so it also computes r_pred.
+
+    readout: 'last_token' (default, byte-identical to V1) | 'mean' | 'attn_pool'.
+    The hazard/sigmoid head is unchanged; only its INPUT vector h changes."""
 
     def forward(self, *args, r_true=None, r_mask=None, **kwargs):
         # The lm_head forward_pre_hook captures the final hidden state into
@@ -295,10 +376,30 @@ def _make_retention_forward(original_forward, head: RetentionHead,
             r_true = holder.r_true
         if r_mask is None:
             r_mask = holder.r_mask
-        anchor_idx = _locate_anchor_positions(input_ids, anchor_ids)
-        h_anchor = h_last[torch.arange(h_last.size(0), device=h_last.device),
-                          anchor_idx]                                  # (B, d)
-        r_pred = head(h_anchor)                                        # (B, T)
+        B = h_last.size(0)
+        ar = torch.arange(B, device=h_last.device)
+        if readout == 'last_token':
+            # EXACT V1 behavior — default; opt-in required to change.
+            anchor_idx = _locate_anchor_positions(input_ids, anchor_ids)
+            h_in = h_last[ar, anchor_idx]                              # (B, d)
+        else:
+            mask, anchor_idx = _build_cot_span_mask(input_ids, open_ids, anchor_ids)
+            anchor_h = h_last[ar, anchor_idx]                          # (B, d) empty-span fallback
+            empty = ~mask.any(dim=1)                                   # rows with no CoT span (e.g. '<cot></cot>')
+            if readout == 'mean':
+                denom = mask.float().sum(1).clamp(min=1.0).unsqueeze(1)
+                h_in = (h_last.float() * mask.float().unsqueeze(-1)).sum(1) / denom
+            elif readout == 'attn_pool':
+                # empty-span rows would NaN; give them a 1-hot mask at the anchor so
+                # MHA is well-defined, then overwrite with the anchor read below.
+                safe_mask = mask.clone()
+                safe_mask[empty, anchor_idx[empty]] = True
+                h_in = attn_pool(h_last, safe_mask)                    # (B, d)
+            else:
+                raise ValueError(f'unknown RETENTION_READOUT={readout!r}')
+            if empty.any():
+                h_in = torch.where(empty.unsqueeze(1), anchor_h.to(h_in.dtype), h_in)
+        r_pred = head(h_in)                                            # (B, T)
         # Set on out for the loss to read. Some downstream transforms (e.g.
         # DeepSpeed/DDP wrappers) may drop arbitrary attrs, so we also stash
         # on the holder as a fallback. RetentionLoss reads via getattr first
@@ -414,6 +515,15 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         # save_pretrained / state_dict / DDP wrapping.
         model.retention_head = head
 
+        # V2 widened readout: RETENTION_READOUT in {last_token, mean, attn_pool}.
+        # Default last_token == byte-identical V1. attn_pool adds the CoTAttnPool
+        # submodule (~16.8M params, trained from init via modules_to_save:[...,retention_pool]).
+        readout = get_env_args('RETENTION_READOUT', str, 'last_token')
+        attn_pool = None
+        if readout == 'attn_pool':
+            attn_pool = CoTAttnPool(hidden_size=d, num_heads=8)
+            model.retention_pool = attn_pool
+
         # If this is a resume / reload (full-FT checkpoint), the trained
         # retention_head.* weights live in the safetensors but were just
         # dropped by HF's from_pretrained as UNEXPECTED keys (because the
@@ -434,12 +544,15 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         try:
             target_device = next(model.parameters()).device
             head.to(target_device)
+            if attn_pool is not None:
+                attn_pool.to(target_device)
         except StopIteration:
             pass
 
         # Resolve the </cot> anchor token ids once at load time.
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         anchor_ids = _find_close_cot_token_ids(tokenizer)
+        open_ids = _find_open_cot_token_ids(tokenizer)
 
         # Install lm_head forward_pre_hook to capture the final hidden state
         # into a per-instance holder. This sidesteps output_hidden_states which
@@ -462,13 +575,15 @@ class Qwen2_5OmniRetentionLoader(ModelLoader):
         # working forward lives on the instance as a routed delegate to
         # model.thinker.forward.
         original_forward = model.forward
-        new_forward = _make_retention_forward(original_forward, head, anchor_ids, holder)
+        new_forward = _make_retention_forward(original_forward, head, open_ids, anchor_ids,
+                                              holder, readout=readout, attn_pool=attn_pool)
         # Bind as instance method so we don't affect other instances.
         import types
         model.forward = types.MethodType(new_forward, model)
 
-        logger.info(f'Attached RetentionHead (type={head_type}, d={d}, T={T_MAX}) '
-                    f'with anchor ids {anchor_ids}')
+        logger.info(f'Attached RetentionHead (type={head_type}, d={d}, T={T_MAX}, '
+                    f'readout={readout}) anchor={anchor_ids} open={open_ids}'
+                    + (' pool=CoTAttnPool(8h,~16.8M)' if attn_pool is not None else ''))
         return model
 
 
