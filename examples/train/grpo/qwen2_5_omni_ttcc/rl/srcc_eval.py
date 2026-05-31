@@ -48,6 +48,9 @@ def spearman(x, y):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--base', default=None,
+                    help='original base model (processor + weights source). REQUIRED for chained RL adapters: '
+                         'their adapter_config base points at the warm-start adapter dir, which has no processor.')
     ap.add_argument('--val-jsonl', required=True)
     ap.add_argument('--plugin', required=True)
     ap.add_argument('--attn-impl', default='flash_attn')   # PINNED across baseline + RL ckpts
@@ -93,7 +96,7 @@ def main():
 
     adapter_cfg = os.path.join(args.checkpoint, 'adapter_config.json')
     if os.path.exists(adapter_cfg):
-        base = json.load(open(adapter_cfg))['base_model_name_or_path']
+        base = args.base or json.load(open(adapter_cfg))['base_model_name_or_path']
         model, proc = get_model_processor(base, torch_dtype=torch.bfloat16, attn_impl=args.attn_impl,
                                           model_kwargs={'device_map': 'cuda'}, model_type='qwen2_5_omni_retention')
         from peft import PeftModel
