@@ -74,7 +74,7 @@ def main():
     tmpl_train=get_template(proc,max_length=args.max_length,template_type='qwen2_5_omni_retention',remove_unused_columns=False)
     tmpl_train.set_mode('train')
     tmpl_gen=get_template(proc,max_length=args.max_length,template_type='qwen2_5_omni_retention',remove_unused_columns=False)
-    tmpl_gen.set_mode('pii')   # inference/generation mode (assistant generated)
+    tmpl_gen.set_mode('transformers')   # HF-inference encode (base.py:598 valid modes: train/transformers/vllm/...; 'pii' is NOT a mode -> UnboundLocalError 'encoded')
     print(f'[gen] loaded {args.checkpoint}')
     rows=[json.loads(l) for l in open(args.val_jsonl) if (json.loads(l).get('R') or json.loads(l).get('R_true'))]
     if args.limit: rows=rows[:args.limit]
