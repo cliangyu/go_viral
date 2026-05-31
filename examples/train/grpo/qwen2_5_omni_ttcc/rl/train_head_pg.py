@@ -5,7 +5,7 @@ ONE forward + a custom loss, and NO text generation / reference model / reward
 model / critic — so swift's RLHF pipeline (`SwiftRLHF(SwiftSft)`, which builds
 ref/reward/value models + vllm rollouts for DPO/PPO/GRPO) does not apply and would
 only get in the way. So we subclass `SwiftSft` and swap ONLY the trainer class to
-`HeadPGTrainer`. See NORTH_STAR §10.
+`HeadPGTrainer`. See HEAD_PG_RL_RUN §10.
 
 Launch:
   1-GPU smoke : python train_head_pg.py <config.yaml> [--override k=v ...]

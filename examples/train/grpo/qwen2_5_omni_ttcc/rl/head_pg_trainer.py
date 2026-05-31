@@ -2,7 +2,7 @@
 """Head-PG REINFORCE RL trainer for the Qwen2.5-Omni retention head, as a
 ms-swift `Seq2SeqTrainer` subclass (override `compute_loss`). Wired in via
 `rl_register.py` (external_plugin) which points TrainerFactory at this class —
-NO swift-core edits, NO register.py edits. See NORTH_STAR §10.
+NO swift-core edits, NO register.py edits. See HEAD_PG_RL_RUN §10.
 
 THE FOUR DETAILS (Leon: "the devil is in the details"):
 

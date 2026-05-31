@@ -1,6 +1,8 @@
-# NORTH STAR — V8 Retention RL (single source of truth)
+# Head-PG RL — Run Record & V8 Findings (formerly "NORTH_STAR")
 
-**Updated**: 2026-05-29. Supersedes the docs in `archive_superseded_20260529/` (kept only for reasoning trail). Companion: `ML_RUN_HYGIENE_PLAYBOOK.md`, `verification/` (scripts + outputs = evidence).
+> **Direction update (2026-05-31).** This doc is the **record of the head-PG RL run** (continuous Gaussian noise on hazards, no CoT). That run is **DONE and came out NULL on ranking**: nodeA (dense exact-gradient rank-SFT) SRCC 0.4393→0.4553, **CI [−0.0151,+0.0465] includes 0**, and IBS **doubled** 0.0067→0.0131 (calibration rot from level-invariance); nodeB REINFORCE SRCC 0.4265 **< baseline** (`../eval_dumps/metrics_baseline_vs_rl.json`). This is the "PPO-RL over-optimized on train" result. **The head-PG direction is not the path forward.** The current direction is **CoT-RL** (GRPO on CoT sequences) — see **`COT_RL_PLAN.md`**. The §1 goal (cross-ad SRCC) and §3 findings (leak-free eval, ckpt-150/225 baseline, the cross-ad-vs-per-ad reward lesson) remain valid and carry into the CoT-RL plan; the §6–§10 head-PG *implementation* is superseded.
+
+**Updated**: 2026-05-29 (head-PG run). Supersedes the docs in `archive_superseded_20260529/` (kept only for reasoning trail). Companion: `ML_RUN_HYGIENE_PLAYBOOK.md`, `COT_RL_PLAN.md` (forward direction), `verification/` (scripts + outputs = evidence).
 
 ---
 

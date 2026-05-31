@@ -1,4 +1,4 @@
-"""Core head-PG (REINFORCE) math, isolated for verification (per RL_DESIGN/NORTH_STAR).
+"""Core head-PG (REINFORCE) math, isolated for verification (per RL_DESIGN/HEAD_PG_RL_RUN).
 
 Policy: per-second hazard logits z ~ N(mu_z, sigma^2) (diagonal Gaussian on the
 UNCONSTRAINED hazards). Curve = exp(-cumsum(softplus(z))) — monotone by construction.

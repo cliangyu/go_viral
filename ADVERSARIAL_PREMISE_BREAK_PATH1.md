@@ -8,7 +8,7 @@ Leon's premise has a hidden precondition: that the head can *read* CoT content.
 It cannot. Two independent breaks, both fatal to Path 1 as stated:
 
 ### Break 1 (FATAL, mechanism): the `</cot>` anchor is dead in BOTH train and eval
-- `NORTH_STAR.md:17` (verified): `tokenizer.encode('</cot>') = [522, 64498, 29]`.
+- `HEAD_PG_RL_RUN.md:17` (verified): `tokenizer.encode('</cot>') = [522, 64498, 29]`.
   The `</` piece (522) is context-dependent and **never matches in-context**.
 - `register._locate_anchor_positions` (register.py:154-178): on no match it falls
   back to `L-1` (the literal last input token).
@@ -64,7 +64,7 @@ realize the anchor, not the CoT, is the block. Attempt to fix the anchor matcher
 (register a real special token, retokenize the 39k train set, re-verify the head
 reads post-CoT h). This is a data + tokenizer + retrain cycle, not a tuning knob.
 Day 4: even if the anchor is fixed, shortcut (problem 2) means generate-cot still ties
-bypass; and generate-cot eval path is independently BROKEN (NORTH_STAR.md:103-105,
+bypass; and generate-cot eval path is independently BROKEN (HEAD_PG_RL_RUN.md:103-105,
 eval_ibs multimodal generate->head TMRoPE path abandoned), so you cannot even MEASURE
 whether CoT helps without first repairing generation. Deadline hits at ~0.44, no
 deliverable improvement, and the negative result is now rushed instead of clean.
@@ -83,7 +83,7 @@ MINIMAL GREEN-LIGHT EVIDENCE (all required, cheap, in priority order — none ne
   bypass by a CI-clean margin, the distilled CoT has no extractable retention signal
   beyond video -> Path 1 cannot help. [~1-2 hr, no training, requires E1 fixed.]
 - E3 (generate-cot eval works): the eval_ibs --generate-cot path must actually run end
-  to end on >=20 ads (currently broken per NORTH_STAR.md:103-105). Without E3 you cannot
+  to end on >=20 ads (currently broken per HEAD_PG_RL_RUN.md:103-105). Without E3 you cannot
   measure the deliverable claim, so Path 1 is unfalsifiable -> do not commit.
 
 KILL-CRITERIA (abort Path 1 immediately if ANY fires):

@@ -1,6 +1,6 @@
 """Head-PG compute_loss core (the novel logic of the custom Trainer).
 
-Design (NORTH_STAR §10): one forward per ad -> h_anchor -> mu_z = head.linear(h_anchor)
+Design (HEAD_PG_RL_RUN §10): one forward per ad -> h_anchor -> mu_z = head.linear(h_anchor)
 -> sample G hazard-noised z' -> curves -> cross_ad_reward -> within-ad advantage
 -> REINFORCE loss + KL. G is memory-free (shared forward). Reward/advantage DETACHED.
 

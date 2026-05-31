@@ -25,7 +25,7 @@ TONIGHT: head_oracle.py NONLINEAR + teacher-forced-GT-CoT probe on frozen ckpt-2
 ### Path 1 (functional-CoT SFT) — REFUTED by construction, NOT a tuning problem
 1. **The `</cot>` anchor is DEAD.** `register._locate_anchor_positions` (register.py:176-177) falls
    back to `L-1` when `</cot>` doesn't match; `tokenizer.encode('</cot>')=[522,64498,29]` never
-   matches in-context (NORTH_STAR.md:17). The head reads the LAST input token in BOTH training and
+   matches in-context (HEAD_PG_RL_RUN.md:17). The head reads the LAST input token in BOTH training and
    eval. So raising token_acc changes WHICH tokens fill the assistant span but routes ZERO CoT
    content into `h_anchor`. token_acc is causally disconnected from the readout.
 2. **The token_acc collapse is real but second-order.** RL_STRATEGY §9 (code-confirmed):
@@ -61,7 +61,7 @@ TONIGHT: head_oracle.py NONLINEAR + teacher-forced-GT-CoT probe on frozen ckpt-2
       space, RL_STRATEGY §9 calls preserved generation a HARD prerequisite);
   (d) credit assignment over ~280 discrete CoT tokens with a sparse scalar IBS reward is strictly
       higher-variance than the 60-dim continuous head-PG that ALREADY failed null;
-  (e) swift GRPO is text-only; a head-conditioned CoT-RL trainer is NEW code (NORTH_STAR §10).
+  (e) swift GRPO is text-only; a head-conditioned CoT-RL trainer is NEW code (HEAD_PG_RL_RUN §10).
 - Six coupled unknowns, each capable of eating a full day, gated on a headroom the linear oracle
   already measures as ~zero. Park as future work.
 
@@ -98,7 +98,7 @@ overnight.
 
 **Day 1 (2026-05-31): LOCK THE FALLBACK FIRST.** Freeze ckpt-225 + the leak-free bypass eval as the
 guaranteed deliverable: SRCC 0.4393, IBS 0.00672 (beats climatology 0.00814 AND a length-aware
-baseline -> "uses video", NORTH_STAR §3.4). Write the negative-result core now: rank_sft dense
+baseline -> "uses video", HEAD_PG_RL_RUN §3.4). Write the negative-result core now: rank_sft dense
 exact-gradient UPPER BOUND found null rank headroom; both RL nodes null/worse; level-invariance ->
 calibration rot; head_oracle linear ceiling 0.5152. This is a defensible CS224R RL deliverable
 regardless of the probe.
@@ -135,7 +135,7 @@ ckpt-225 or the bypass eval.
 ## WHERE THE EXPERTS WERE RIGHT/WRONG
 - **Skeptic (Phase-1 #4) was RIGHT and decisive:** the dead `</cot>` anchor (head reads L-1 in train
   AND eval) refutes "token_acc up => CoT useful" at the mechanism level. Verified in register.py +
-  NORTH_STAR.md:17. lean = ship_sft_negative_result.
+  HEAD_PG_RL_RUN.md:17. lean = ship_sft_negative_result.
 - **Info-theory refutation (Phase-2 #1) was RIGHT:** CoT = f(video) -> I(CoT;R|video)=0; the
   extractability fallback is bounded by head_oracle (linear 0.5152) + rank_sft (exact-gradient null).
   Correctly demands the nonlinear probe as the only un-foreclosed test.

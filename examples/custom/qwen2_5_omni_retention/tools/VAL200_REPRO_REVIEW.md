@@ -14,7 +14,7 @@ matches. It does not.
 Provenance of the trusted file (not from this script):
 - `V8_LAUNCH_RUNBOOK.md:172,188` — trusted file is copied from
   `s3://$S3_BUCKET/ttcc_v7_data/val_200_no_cot.jsonl`, i.e. a **V7-pipeline** artifact.
-- `NORTH_STAR.md:22` — "`val_200_no_cot.jsonl` is an arbitrary `--limit 200` smoke
+- `HEAD_PG_RL_RUN.md:22` — "`val_200_no_cot.jsonl` is an arbitrary `--limit 200` smoke
   subset (effectively 168 — partial video mirror on the 2-card box)."
 
 So the trusted 200 ad_ids were determined by (a) the V7 `ttcc_train_sft.jsonl` row
