@@ -48,7 +48,7 @@ top_p: 0.95
 max_completion_length: 512            # measured CoT p99=430, max 527
 beta: 0.001                           # KL to SFT ref (grpo.sh: 0.04 was 16x too strong)
 reward_funcs: [ttcc_head, ttcc_cot_format]
-reward_weights: [1.0, 0.15]
+reward_weights: ['1.0', '0.15']    # QUOTED: numeric yaml lists crash parse_yaml_args (floats into argv, not str())
 # HF generate (TransformersEngine), NOT vLLM. vLLM can't load our custom qwen2_5_omni_retention
 # head (no r_pred -> no reward) and its Qwen-Omni video+audio support is incomplete; our entire
 # pipeline (generate_eval, SFT eval) uses model.generate(). swift gates vllm behind is_vllm_available
@@ -57,6 +57,8 @@ use_vllm: false
 log_completions: true
 
 # --- tuner: LoRA on the text decoder (tonight's lower-risk choice) ---
+# NOTE: with `adapters:` set, swift continues the SFT adapter (tuner.from_pretrained) and INHERITS its
+# adapter_config.json -- lora_rank/alpha/target_modules below are IGNORED (no fresh LoRA stacked). Kept for clarity.
 tuner_type: lora
 lora_rank: 16
 lora_alpha: 32

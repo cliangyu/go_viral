@@ -5,7 +5,10 @@ from abc import ABC
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
-from swift.infer_engine import GRPOVllmEngine
+try:  # GRPOVllmEngine pulls vllm; used here only as a type hint. Make optional so
+    from swift.infer_engine import GRPOVllmEngine  # use_vllm=false runs with no vllm installed.
+except ImportError:
+    GRPOVllmEngine = None
 from swift.infer_engine.protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, RequestConfig,
                                          RolloutInferRequest, RolloutOutput)
 from swift.template import Messages
