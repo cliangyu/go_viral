@@ -14,4 +14,6 @@ always saved+logged, tune meaningfully (evidence-based, per COT_GRPO_RUN_PLAN.md
 - **Held-out cross-ad SRCC** (Goodhart guard) on best checkpoints at phase transitions + at the end.
 
 ## Cycle log
-- **19:35Z — Phase 1 launched.** 2-node (i-06cb MASTER + i-0f1d), ckpt-1600, GA=2/eff-32, G=8/512, temp 0.4. Step 1: reward 1.27, reward_std 0.018 (thin — watching), fail_frac 0, kl 1.86, no OOM. Backup loop + heartbeat armed.
+- **19:35Z — Phase 1 launched** (tensorboard-only, crude backup). Ran clean to step ~6.
+- **19:50Z — W&B INCIDENT + recovery.** Relaunched to add W&B + the proven `rl_ckpt_backup.sh`. W&B crashed all ranks: `PermissionError` writing to `<cwd>/wandb` (repo root, not ssm-user-writable). Root-caused, killed the orphaned node-1 (was burning GPU), fixed `WANDB_DIR=<OUT>` (committed 400d53ef), relaunched both nodes (port 29516).
+- **19:52Z — Phase 1 RE-LAUNCHED, healthy.** run dir `v2-20260531-114830`. **W&B: https://wandb.ai/liangyuch/ttcc/runs/ktff132d**. Step 1: reward 1.27, fail_frac 0, kl 1.86, 16 GPU @100%. Proven per-node ckpt backup (both nodes) + analyze_dynamics.py + 15-min heartbeat all live. temp 0.4 baseline; watching within-group spread (reward_std ~0.02-0.05, thin → temp 0.8 candidate).
