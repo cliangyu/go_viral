@@ -87,6 +87,8 @@ def main():
             rg=dict(r); rg['messages']=list(r['messages']); rg['messages'][-1]={'role':'assistant','content':''}
             enc=tmpl_gen.encode(TemplateInputs.from_dict(rg)); batch=tmpl_gen.data_collator([enc])
             batch={k:(v.cuda() if isinstance(v,torch.Tensor) else v) for k,v in batch.items()}
+            for _k in ('r_true','r_mask','ad_id','T','R','labels','loss_scale','channel'):
+                batch.pop(_k,None)   # retention-head TARGETS, not HF generate kwargs (else ValueError: model_kwargs not used)
             with torch.no_grad():
                 gen=model.generate(**batch,max_new_tokens=args.max_new,do_sample=False,num_beams=1)
             in_len=batch['input_ids'].shape[1]; new=gen[0][in_len:]
