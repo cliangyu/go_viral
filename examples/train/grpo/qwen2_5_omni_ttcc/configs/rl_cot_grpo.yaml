@@ -1,0 +1,83 @@
+# CoT-GRPO — RL on the GENERATED CoT, reward = the retention HEAD reading that CoT.
+#
+# Official swift GRPO (rlhf_type=grpo) drives generation / advantage / KL / vLLM / multi-node.
+# The ONLY custom part is the reward: CoTGRPOTrainer fills the `ttcc_head` column by forwarding
+# the policy through the head on each generated CoT (cross-ad rank vs the train CDF + IBS anchor).
+#
+# ** LAUNCH: RL_ENTRY=rl/train_cot_grpo.py bash rl.sh configs/rl_cot_grpo.yaml ** (NOT `swift sft`/`swift rlhf`).
+# Multi-node (2x8): set NNODES=2 NODE_RANK={0,1} MASTER_ADDR=<node0> MASTER_PORT=29501 (SFT holds 29500).
+# Tonight = LoRA + last-token head (lower risk; see COT_RL_PLAN.md §7). Warm-start from the SFT-with-CoT adapter.
+
+model: /opt/dlami/nvme/home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+# adapters: warm-start from the FINAL SFT-with-CoT (shift-fixed) checkpoint. Override per run:
+#   --override 'adapters=[/opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_v8_with_cot/v0-20260530-143449/checkpoint-XXXX]'
+adapters:
+  - /opt/dlami/nvme/v8_eval/fixed_ckpt_latest
+torch_dtype: bfloat16
+attn_impl: flash_attn                 # PINNED; head readout kernel must match the SRCC baseline
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py      # model + retention head
+  - examples/train/grpo/plugin/ttcc_head_plugin.py          # head-reward column placeholder (filled by the trainer)
+  - examples/train/grpo/plugin/ttcc_cot_format_plugin.py    # <cot>...</cot> structure reward
+model_type: qwen2_5_omni_retention
+
+rlhf_type: grpo
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  TRAIN_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # train-only, val-disjoint (read by CoTGRPOTrainer)
+  COT_BETA: '1.0'                     # R_rank weight (cross-ad, primary)
+  COT_ALPHA: '0.25'                   # R_acc = 1-IBS calibration anchor
+  COT_T_LO: '1'
+  COT_T_HI: '30'
+
+# --- RL data: assistant=<cot></cot> (model GENERATES the CoT); R/T/ad_id carried for the reward ---
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+remove_unused_columns: false          # KEEP R / T / ad_id for the reward
+group_by_length: false
+
+# --- GRPO rollout (HP base = grpo.sh; the matching TEXT-GRPO evidence) ---
+num_generations: 8                    # G; raised from grpo.sh's 4 for group rank statistics + the curve-std gate
+temperature: 0.4
+top_p: 0.95
+max_completion_length: 512            # measured CoT p99=430, max 527
+beta: 0.001                           # KL to SFT ref (grpo.sh: 0.04 was 16x too strong)
+reward_funcs: [ttcc_head, ttcc_cot_format]
+reward_weights: [1.0, 0.15]
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.35
+log_completions: true
+
+# --- tuner: LoRA on the text decoder (tonight's lower-risk choice) ---
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32
+target_modules: all-linear
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+deepspeed: zero2                      # grpo.sh backend for LoRA GRPO
+torch_compile: false
+
+num_train_epochs: 1
+learning_rate: 5.0e-6                 # grpo.sh (LoRA GRPO)
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+per_device_train_batch_size: 1        # head re-encodes one row at a time -> no last-token pad issue
+gradient_accumulation_steps: 8
+
+logging_steps: 1
+eval_strategy: 'no'                   # held-out cross-ad SRCC tracked out-of-loop per checkpoint
+save_steps: 25
+save_total_limit: 20
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/rl_cot_grpo_v1
+
+dataloader_num_workers: 4

@@ -12,7 +12,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/_common.sh"
 REPO_ROOT="$(cd "${HERE}/../../../.." && pwd)"     # examples/train/grpo/qwen2_5_omni_ttcc -> repo root
-ENTRY="${HERE}/rl/train_head_pg.py"
+# ENTRY defaults to head-PG; override for CoT-GRPO: RL_ENTRY=rl/train_cot_grpo.py (abs or relative-to-HERE)
+ENTRY="${RL_ENTRY:-${HERE}/rl/train_head_pg.py}"
+[[ "${ENTRY}" = /* ]] || ENTRY="${HERE}/${ENTRY}"
 
 CONFIG="${1:?path to configs/<variant>.yaml required}"; shift || true
 [[ -f "${CONFIG}" ]] || { echo "config not found: ${CONFIG}" >&2; exit 1; }
