@@ -1,0 +1,90 @@
+# V8-LoRA — SFT, retention head (hazard), LoRA on backbone, WITH cleaned CoT.
+#
+# Derived from sft_retention_hazard_full_with_cot.yaml (the V8 run that crashed
+# with token_acc collapse) by applying the LoRA recipe from
+# sft_retention_hazard_lora_with_cot.yaml, RECONCILED for the V8 no-audio lineage.
+#
+# WHY LoRA (evidence-led): the gradient probe showed the curve-MSE gradient
+# overpowers the LM CE gradient 45-384x on the shared backbone -> full-FT
+# destroyed the LM (token_acc 0.557->0.004). LoRA freezes the base LM weights so
+# the curve task CANNOT overwrite them (catastrophic-forgetting evidence: LoRA
+# forgets less, arXiv:2405.09673). The retention head is NEW -> it is trained
+# FULLY via modules_to_save (it has no base weight to adapt).
+#
+# RECONCILIATIONS vs the old LoRA config (which predates V8 no-audio):
+#  - DeepSpeed: NONE (DDP). The old LoRA cfg used zero2, but on V8 audios=[] data
+#    zero2 triggers the audio_tower dummy-tensor crash (the reason V8-full used
+#    zero3). LoRA's trainable state is tiny so ZeRO is unneeded; no-deepspeed makes
+#    is_deepspeed_enabled()=False -> the dummy-audio branch is skipped -> no bug.
+#    [VERIFY in smoke; fallback = deepspeed: zero3]
+#  - attn_impl: flash_attn (parity with srcc_eval's pinned kernel; NOT FA3).
+#  - dataset: the CLEANED V2 CoT (audio refs + impossible 'gain' removed).
+#  - alpha: start 0.1 (probe full-FT range was 0.1-0.3; LoRA balance DIFFERS ->
+#    must re-calibrate from logged loss_curve/loss_cot during the smoke).
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_COT_ALPHA: '0.1'                 # CALIBRATE from logged loss_curve/loss_cot; try {0.05,0.1,0.2}
+
+# Cleaned CoT (de-audio + de-gain), structurally verified (C2/C3/C4=0).
+dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot_clean_v2.jsonl
+# TODO: replace with a CLEANED with-cot val so eval token_acc is meaningful
+# (LM-preservation monitor). For now eval_loss=curve MSE is still meaningful.
+val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
+eval_strategy: steps
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+# ---- LoRA ----
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32                               # 2x rank (standard)
+lora_dropout: 0.05                           # mild regularization vs over-memorization
+target_modules: all-linear                   # backbone linear layers get adapters
+modules_to_save:                             # the NEW head is trained FULLY + saved in the adapter
+  - retention_head
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+# DDP smoke (2026-05-30) OOM'd: single-node DDP replicates the full 4.7B base on every
+# GPU -> no headroom for the LM-head logits (~17.7GB) of the longest video samples
+# (T>54s ads at max_length=32768). Switched to the documented fallback ZeRO-3: it shards
+# the base (~8GB/GPU freed), is the audio_tower-bug-SAFE deepspeed mode (the buggy branch
+# is `is_deepspeed_enabled() and not is_deepspeed_zero3_enabled()` -> skipped under zero3),
+# and LoRA adds ~0 optimizer state so it fits with more margin than the alpha full-FT run.
+deepspeed: zero3
+
+num_train_epochs: 3                          # shorter first pass; the collapse (if any) shows by ~step 110
+learning_rate: 1.0e-4                         # LoRA tolerates / needs higher LR than full-FT 5e-6
+warmup_ratio: 0.05
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+logging_steps: 1                             # log every step (we MUST see loss_curve/loss_cot/token_acc)
+eval_steps: 50
+save_steps: 50
+save_total_limit: 20
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_v8_with_cot
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

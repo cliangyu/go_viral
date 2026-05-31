@@ -1,0 +1,145 @@
+# V8-ALPHA: full-FT hazard SFT, CLEANED CoT, tuned alpha (the 2 changes vs V8). Everything else = V8 verbatim.
+# SFT, retention head (hazard), FULL fine-tune, WITH CoT.
+#
+# Custom model_type qwen2_5_omni_retention with a softplus hazard head
+# reading the hidden state at the last </cot> token. R(t) = exp(-cumsum(λ))
+# is monotone non-increasing by construction.
+#
+# Joint loss:
+#   L = masked_MSE(R_pred, R_true) + RETENTION_COT_ALPHA * LM_CE(assistant_tokens)
+#
+# Initialization from base Qwen/Qwen2.5-Omni-3B (NOT from V7 ckpts).
+#
+# IMPORTANT — why base init, not V7 ckpt:
+#
+# V7 training (no-CoT variant) had a label-in-input leak: the train data
+# put the ground-truth R(t) into the assistant span. The head read
+# h[last_input_token] (= the last `}` of the answer JSON) and trivially
+# echoed the answer. Three independent audits (randomization probe,
+# video-swap, constant-predictor sanity) confirm V7's backbone did NOT
+# learn video-retention reasoning. Initializing V8 from a V7 ckpt would
+# carry the leak-path corruption forward. Base Qwen2.5-Omni-3B has
+# pristine multimodal pre-training and is the correct starting point.
+#
+# See INCIDENT_2026-05-26_EVAL_LEAK.md (in the ttcc-eval repo) for the
+# full incident review.
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attention_3
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+# Head-type and CoT loss weight are env-var-driven (read by the plugin).
+# ENV key is mandatory — see swift/cli/main.py:53.
+#
+# Alpha rationale (REVISED post-leak):
+#
+# When the head is initialized from V7 ckpt (a CONVERGED point on the leak
+# path), curve MSE is small (~1e-4) and the principled balance is
+# alpha ~3e-5. But that was the wrong setting because we're no longer
+# starting from a converged head.
+#
+# With base Qwen2.5-Omni-3B init, the retention head is RANDOM. Initial
+# curve MSE will be ~0.1 (random predictions). The CoT CE term (~3 per
+# token) needs to be comparable to curve MSE to actually drive LM head
+# learning. alpha=1e-3 gives CoT contribution ~3e-3 vs curve ~0.1 (~3% of
+# loss), small enough to let the head converge but large enough that the
+# LM head learns CoT generation in parallel.
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_COT_ALPHA: '0.1'   # FIX: probe showed 1e-3 -> CE gradient drowned 45-384x; 0.1 balances it
+
+# CoT-distilled dataset (merged with the no-CoT base via build_v8_train_jsonl.py).
+# Each row carries R (per-second retention) and an assistant span wrapping
+# `<cot>...</cot>` with the Gemini-distilled reasoning.
+dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot_clean_v2.jsonl
+val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
+eval_strategy: steps
+# max_length=32768 chosen 2026-05-28 based on actual token measurement
+# (60-row sample on no-audio jsonl). With audio dropped:
+#   - video tokens scale ~600/sec; 60s ads ~36K tokens (60 frames * 600)
+#   - text tokens (system + user + <cot>...) ~200-770
+#   - audio tokens 0 (USE_AUDIO_IN_VIDEO=false + audios=[])
+#
+# At max_length=49152 the long ads (T>54s, ~15% of corpus) push GPU
+# activation memory past 80GB on H100 with ZeRO-3 + max grad_accum=8.
+# Step 1 completed at memory=36GB but step 2 with a longer batch SIGKILL'd.
+# Choosing 32768 trades ~15% data drop (T<=54s ads kept) for stable
+# 60-80GB GPU memory headroom.
+#
+# truncation_strategy=delete drops rows over the cap (vs truncate-right
+# which would chop the assistant <cot>...</cot> tail — that's load-bearing
+# for the retention head anchor at h[</cot>]).
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+# Required: the retention plugin's _data_collator reads R from the raw row
+# (via _extra_kwargs) to build r_true / r_mask. Removing unused columns
+# strips R before collation.
+remove_unused_columns: false
+
+# Full FT; freeze the audio/visual towers and aligner to match milestone spec.
+tuner_type: full
+freeze_vit: true
+freeze_aligner: true
+
+# ZeRO-3 (reverted from ZeRO-2 on 2026-05-28 17:59 UTC).
+#
+# We tried ZeRO-2 to recover the 5-15% speed loss from comm overhead, but it
+# triggered a separate bug in swift/template/templates/qwen.py:906-911:
+#
+#   if input_features is None:
+#       if is_deepspeed_enabled() and not is_deepspeed_zero3_enabled():
+#           # Note: ZeRO-3 still results in hangs; for audio training, please use ZeRO-2.
+#           input_features = input_ids.new_zeros([1, 128, 128], ...)
+#           audio_res = model.thinker.get_audio_features(input_features, ...)
+#
+# With audios=[] in our jsonl rows, input_features is None. Under ZeRO-2 the
+# template invokes audio_tower with a DUMMY zero tensor (to keep gradient sync
+# alive across ranks). audio_tower then hits the cu_seqlens 3D FA3 bug we
+# already documented in INCIDENT_2026-05-28_AUDIO_OOB.md. Under ZeRO-3 this
+# code path is skipped entirely (the template has it gated behind
+# `not is_deepspeed_zero3_enabled()`), so audio_tower is never called and the
+# FA3 issue doesn't surface.
+#
+# Going back to ZeRO-3 is the lowest-risk path: we know it ran for 15 steps
+# without the audio_tower path firing. The speed cost is 5-15% which we have
+# budget for given CB ~120h remaining.
+#
+# Future: to recover the ZeRO-2 speedup, either (a) patch the swift template
+# to skip the dummy audio call when no audio is in the row, or (b) force
+# audio_tower to use SDPA via config override in register.py.
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false                          # head is too small to amortize compile
+deepspeed: zero3
+
+# 10 epochs because we're training from base (random retention head).
+# V7 reached its plateau at ~6 epochs from base init; expect similar.
+# learning_rate matches V7's 5e-6 (the well-tested setting for full FT
+# from base on this task). Lower (1e-6) was for warm-start continuation
+# from a converged ckpt; that plan was abandoned after the V7 leak finding.
+num_train_epochs: 10
+learning_rate: 5.0e-6
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+
+logging_steps: 1
+eval_steps: 50
+save_steps: 75
+save_total_limit: 10
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_full_cleancot_alpha
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4
