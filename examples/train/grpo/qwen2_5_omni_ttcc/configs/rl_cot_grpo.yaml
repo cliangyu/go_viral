@@ -12,7 +12,7 @@ model: /opt/dlami/nvme/home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
 # adapters: warm-start from the FINAL SFT-with-CoT (shift-fixed) checkpoint. Override per run:
 #   --override 'adapters=[/opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_v8_with_cot/v0-20260530-143449/checkpoint-XXXX]'
 adapters:
-  - /opt/dlami/nvme/v8_eval/fixed_ckpt_latest
+  - /opt/dlami/nvme/ssm-out/sft_readout_v2_attn_pool/v0-20260531-225451/checkpoint-550
 torch_dtype: bfloat16
 attn_impl: flash_attn                 # PINNED; head readout kernel must match the SRCC baseline
 
@@ -26,6 +26,16 @@ rlhf_type: grpo
 
 ENV:
   RETENTION_HEAD_TYPE: hazard
+  RETENTION_READOUT: attn_pool       # B2 attn-pool readout -- MUST match the SFT ckpt; default last_token is the silent-degrade trap
+  # --- Video/length caps: MUST match the B2 SFT (sft_readout_v2_attn_pool) processing. These mirror _common.sh and are pinned here so the GRPO rollout uses the SAME video representation B2 trained on (alignment) and the prompt seq stays bounded (~<=8192), preventing the lm_head OOM.
+  FPS: '1.0'
+  FPS_MAX_FRAMES: '60'
+  VIDEO_MAX_TOKEN_NUM: '8192'
+  MAX_PIXELS: '200704'           # B2 SFT value (_common.sh); restored (None was a wrong removal)
+  VIDEO_MAX_PIXELS: '200704'     # B2 SFT value (_common.sh)
+  ENABLE_AUDIO_OUTPUT: 'false'  # match B2 SFT
+  MAX_LENGTH: '32768'      # B2 SFT actual value (verified args.json/log); prior 8192 was a wrong fix that deleted long rows
+  USE_AUDIO_IN_VIDEO: 'true'       # B2 SFT trained with use_audio_in_video=True (verified in its log); GRPO MUST match
   TRAIN_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz   # train-only, val-disjoint (read by CoTGRPOTrainer)
   COT_BETA: '1.0'                     # R_rank weight (cross-ad, primary)
   COT_ALPHA: '0.25'                   # R_acc = 1-IBS calibration anchor
@@ -34,7 +44,7 @@ ENV:
 
 # --- RL data: assistant=<cot></cot> (model GENERATES the CoT); R/T/ad_id carried for the reward ---
 dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
-max_length: 32768
+max_length: 32768                     # REVERTED from wrong 8192 -> B2's actual SFT max_length; OOM is fixed by VIDEO_MAX_TOKEN_NUM=8192, not by shortening this
 truncation_strategy: delete
 lazy_tokenize: true
 strict: false
@@ -43,9 +53,10 @@ group_by_length: false
 
 # --- GRPO rollout (HP base = grpo.sh; the matching TEXT-GRPO evidence) ---
 num_generations: 8                    # G; raised from grpo.sh's 4 for group rank statistics + the curve-std gate
-temperature: 0.4
-top_p: 0.95
-max_completion_length: 512            # measured CoT p99=430, max 527
+temperature: 1.0
+top_p: 1.0
+max_completion_length: 768            # measured CoT p99=430, max 527
+overlong_filter: true            # RL length-growth insurance: drop truncated (overlong) completions from the loss (swift args_mixin overlong_filter)
 beta: 0.001                           # KL to SFT ref (grpo.sh: 0.04 was 16x too strong)
 reward_funcs: [ttcc_head, ttcc_cot_format]
 reward_weights: ['1.0', '0.15']    # QUOTED: numeric yaml lists crash parse_yaml_args (floats into argv, not str())

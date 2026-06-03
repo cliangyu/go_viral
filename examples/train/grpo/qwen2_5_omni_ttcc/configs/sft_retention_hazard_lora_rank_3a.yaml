@@ -1,0 +1,76 @@
+# Rung 3a — LoRA SFT, hazard head, WITH cleaned CoT, + cross-ad RANK loss.
+# DERIVED FROM sft_retention_hazard_lora_v8_with_cot.yaml ("follow last prod"):
+# IDENTICAL except the rank loss + the readout. Deltas marked  # <<RANK.
+#
+#   <<RANK 1: external_plugins -> register_rank.py (the additive variant; lambda=0 == prod)
+#   <<RANK 2: ENV adds RETENTION_READOUT=attn_pool (B2: ~2x gradient) + the rank flags
+#   <<RANK 3: modules_to_save adds retention_pool (attn_pool) + retention_rank (the affine)
+#   <<RANK 4: dataset -> the pct-joined train jsonl (carries the global percentile target)
+#   <<RANK 5: gradient_accumulation_steps 8 -> 4  (16 GPU x bs1 x ga4 = eff-batch 64 == prod)
+# Everything else is byte-identical to the last prod SFT run.
+
+model: /home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+torch_dtype: bfloat16
+attn_impl: flash_attn
+
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register_rank.py    # <<RANK 1
+model_type: qwen2_5_omni_retention
+loss_type: retention_loss
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_COT_ALPHA: '0.1'
+  RETENTION_READOUT: attn_pool                # <<RANK 2  (was last_token by default)
+  RETENTION_RANK_LOSS: pairwise               # <<RANK 2  {none,pairwise,pointwise,both}; sweep decides
+  RETENTION_RANK_LAMBDA: '0.3'                # <<RANK 2  weight; grad-norm parity + sweep {0.03,0.1,0.3,1.0}
+  RETENTION_RANK_BETA: '10.0'                 # <<RANK 2  pairwise BT temperature
+  RANK_GRADLOG_EVERY: '0'                     # <<RANK 2  DISABLED: autograd.grad+retain_graph errors under ZeRO-3 (smoke confirmed); loss-value logging stands
+
+dataset: /home/ssm-user/work/data/ttcc_v8/ttcc_train_with_cot_clean_v2_pct.jsonl   # <<RANK 4
+val_dataset: /home/ssm-user/work/data/ttcc_holdout/val_200_no_cot.jsonl
+eval_strategy: steps
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+dataset_num_proc: 1
+group_by_length: false
+remove_unused_columns: false
+
+# ---- LoRA (identical to prod) ----
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: all-linear
+modules_to_save:                             # <<RANK 3  new heads trained FULLY + saved in the adapter
+  - retention_head
+  - retention_pool                           # <<RANK 3  CoTAttnPool (attn_pool readout)
+  - retention_rank                           # <<RANK 3  the sigmoid(a*m+b) percentile affine
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+vit_gradient_checkpointing: true
+torch_compile: false
+deepspeed: zero3
+
+num_train_epochs: 3
+learning_rate: 1.0e-4
+warmup_ratio: 0.05
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4               # <<RANK 5  (16 GPU -> eff-batch 64)
+
+logging_steps: 1
+eval_steps: 50
+save_steps: 50
+save_total_limit: 20
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_rank_3a
+
+dataloader_num_workers: 4
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4
+dataloader_drop_last: true                   # <<RANK 6  every rank has a full batch every step -> all_gather shapes equal (no deadlock at epoch boundary)

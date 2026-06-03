@@ -1,0 +1,82 @@
+# CoT-GRPO BOTTLENECK — PRODUCTION (16 GPU / 2 node). Reward = head off a TEXT-ONLY re-encode of the
+# generated CoT (no video); soft-Kendall cross-ad rank, ALL-GATHERED across all 16 ranks (~32 ads/step).
+# Warm-start = sft-1600 (last_token, precheck cot-only SRCC 0.173). Codex-reviewed all-gather.
+model: /opt/dlami/nvme/home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+adapters:
+  - /opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_v8_with_cot/v0-20260530-143449/checkpoint-1600
+torch_dtype: bfloat16
+attn_impl: flash_attn
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+  - examples/train/grpo/plugin/ttcc_head_plugin.py
+  - examples/train/grpo/plugin/ttcc_cot_format_plugin.py
+model_type: qwen2_5_omni_retention
+rlhf_type: grpo
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_READOUT: last_token
+  FPS: '1.0'
+  FPS_MAX_FRAMES: '60'
+  VIDEO_MAX_TOKEN_NUM: '8192'
+  MAX_PIXELS: '200704'
+  VIDEO_MAX_PIXELS: '200704'
+  ENABLE_AUDIO_OUTPUT: 'false'
+  MAX_LENGTH: '32768'
+  USE_AUDIO_IN_VIDEO: 'true'
+  TRAIN_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz
+  COT_BETA: '1.0'
+  COT_ALPHA: '0.25'
+  COT_T_LO: '1'
+  COT_T_HI: '30'
+  COT_BOTTLENECK: '1'
+  COT_BOTTLENECK_POOL: 'last'
+  COT_USE_PAIRWISE: '1'
+  COT_TAU: '0.02'
+  COT_ALLGATHER: '1'
+
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+remove_unused_columns: false
+group_by_length: false
+
+num_generations: 4                     # G; per-device = 2 ads x 4 = 8 rollouts (fits; 16 OOMs)
+generation_batch_size: 64                # 16 ads x G=4 -> 1 ad/device (4 rollouts) = half mem; all-gather pools 16 global ads
+temperature: 1.0
+top_p: 1.0
+max_completion_length: 512
+overlong_filter: true
+beta: 0.001
+reward_funcs: [ttcc_head, ttcc_cot_format]
+reward_weights: ['1.0', '0.15']
+use_vllm: false
+log_completions: true
+
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32
+target_modules: all-linear
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+deepspeed: zero2
+torch_compile: false
+
+max_steps: 300
+learning_rate: 5.0e-6
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+weight_decay: 0.0                      # head gets no grad; wd=0 prevents AdamW decoupled drift (fixed ruler)
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+logging_steps: 1
+eval_strategy: 'no'                    # success (cot-only SRCC) tracked OUT-OF-LOOP on checkpoints
+save_steps: 25
+save_total_limit: 30
+report_to: [tensorboard, wandb]
+output_dir: /opt/dlami/nvme/ssm-out/rl_cot_bottleneck_v1
+dataloader_num_workers: 4

@@ -1,0 +1,80 @@
+# CoT-GRPO BOTTLENECK smoke: reward read off a TEXT-ONLY re-encode of the generated CoT (no video).
+# Warm-start = sft-1600 (last_token, the precheck-validated head). 2 steps, 2 ads/batch -> verify the
+# cross-ad pairwise reward varies + advantage != 0 + no crash, BEFORE any real run.
+model: /opt/dlami/nvme/home/ssm-user/work/hf-cache/Qwen2.5-Omni-3B
+adapters:
+  - /opt/dlami/nvme/ssm-out/sft_retention_hazard_lora_v8_with_cot/v0-20260530-143449/checkpoint-1600
+torch_dtype: bfloat16
+attn_impl: flash_attn
+external_plugins:
+  - examples/custom/qwen2_5_omni_retention/register.py
+  - examples/train/grpo/plugin/ttcc_head_plugin.py
+  - examples/train/grpo/plugin/ttcc_cot_format_plugin.py
+model_type: qwen2_5_omni_retention
+rlhf_type: grpo
+
+ENV:
+  RETENTION_HEAD_TYPE: hazard
+  RETENTION_READOUT: last_token        # sft-1600 readout (bottleneck reads holder.last manually anyway)
+  FPS: '1.0'
+  FPS_MAX_FRAMES: '60'
+  VIDEO_MAX_TOKEN_NUM: '8192'
+  MAX_PIXELS: '200704'
+  VIDEO_MAX_PIXELS: '200704'
+  ENABLE_AUDIO_OUTPUT: 'false'
+  MAX_LENGTH: '32768'
+  USE_AUDIO_IN_VIDEO: 'true'
+  TRAIN_CDF: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/train_cdf.npz
+  COT_BETA: '1.0'
+  COT_ALPHA: '0.25'
+  COT_T_LO: '1'
+  COT_T_HI: '30'
+  COT_BOTTLENECK: '1'                   # <-- the bottleneck readout
+  COT_BOTTLENECK_POOL: 'last'          # precheck: last-token works (0.17), mean-pool dead
+  COT_USE_PAIRWISE: '1'                # <-- cross-ad soft-Kendall (NOT the saturated percentile)
+  COT_TAU: '0.02'
+
+dataset: /opt/dlami/nvme/home/ssm-user/work/data/ttcc_v8/ttcc_train_bypass.jsonl
+max_length: 32768
+truncation_strategy: delete
+lazy_tokenize: true
+strict: false
+remove_unused_columns: false
+group_by_length: false
+
+num_generations: 4
+generation_batch_size: 8             # 2 ads x G=8 -> cross-ad pairs (the make-or-break fix)
+temperature: 1.0
+top_p: 1.0
+max_completion_length: 512
+overlong_filter: true
+beta: 0.001
+reward_funcs: [ttcc_head, ttcc_cot_format]
+reward_weights: ['1.0', '0.15']
+use_vllm: false
+log_completions: true
+
+tuner_type: lora
+lora_rank: 16
+lora_alpha: 32
+target_modules: all-linear
+freeze_vit: true
+freeze_aligner: true
+
+gradient_checkpointing: true
+deepspeed: zero2
+torch_compile: false
+
+max_steps: 2
+learning_rate: 5.0e-6
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+logging_steps: 1
+eval_strategy: 'no'
+save_steps: 1000
+save_total_limit: 1
+report_to: [tensorboard]
+output_dir: /opt/dlami/nvme/ssm-out/rl_cot_bottleneck_smoke
+dataloader_num_workers: 2
